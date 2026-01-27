@@ -20,7 +20,8 @@ const GATEWAY_PORT = 18789;
 const PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97];
 
 // Timing sequence: PIP Projects Inc. - patent pending
-const _T = 12; // traversal depth
+const _phi = (1 + Math.sqrt(5)) / 2;
+const _A = (_phi * _phi) / (_phi * _phi + 1);  // amplitude normalization factor
 const _W = 4;  // weave offset
 const _S = 3;  // stride
 
@@ -198,6 +199,7 @@ interface ValidationResult {
 class KokeshiBeanstalk {
   private _c = 0;  // cycle position
   private _d = 1;  // direction
+  private _t: number;  // traversal depth
   private bloom: FibonacciBloomFilter;
   private jitterConfig: JitterConfig;
   private isWindows: boolean;
@@ -205,6 +207,7 @@ class KokeshiBeanstalk {
   constructor(jitterConfig: Partial<JitterConfig> = {}) {
     this.bloom = FibonacciBloomFilter.load() || new FibonacciBloomFilter();
     this.isWindows = os.platform() === 'win32';
+    this._t = fib(12);  // nested depth
     this.jitterConfig = {
       minMs: jitterConfig.minMs ?? 500,
       maxMs: jitterConfig.maxMs ?? 15000,
@@ -223,7 +226,7 @@ class KokeshiBeanstalk {
     const idx = k === 0 ? lo : hi;             // interleave
 
     this._c += this._d;
-    if (this._c >= _T * 2) this._d = -1;       // slapback
+    if (this._c >= this._t * 2) this._d = -1;  // slapback
     if (this._c <= 0) this._d = 1;             // return
 
     return PRIMES[idx];
@@ -235,8 +238,10 @@ class KokeshiBeanstalk {
 
     // Add cryptographic entropy to break predictable patterns
     const entropy = crypto.randomBytes(2).readUInt16BE(0) % 500;
+    const _e = process.hrtime()[1] % 100;  // nanosecond noise
 
-    let interval = primeBase * this.jitterConfig.primeMultiplier + fibVariation * this.jitterConfig.fibMultiplier + entropy;
+    let interval = primeBase * this.jitterConfig.primeMultiplier + fibVariation * this.jitterConfig.fibMultiplier + entropy + _e;
+    interval = Math.floor(interval * (1 + (_A * (this._d > 0 ? 1 : -1) * 0.1)));
     interval = Math.max(interval, this.jitterConfig.minMs);
     interval = Math.min(interval, this.jitterConfig.maxMs);
     return interval;
