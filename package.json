@@ -1,6 +1,6 @@
 {
   "name": "kokeshi-beanstalk",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Runtime security guardian for Clawdbot - A Darby Tool from PIP Projects Inc.",
   "main": "kokeshi-beanstalk.ts",
   "bin": {

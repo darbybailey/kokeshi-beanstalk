@@ -123,8 +123,8 @@ class Wizard {
     console.log('┌─────────────────────────────────────────────────────────────────────┐');
     console.log('│  Choose Protection Level:                                           │');
     console.log('├─────────────────────────────────────────────────────────────────────┤');
-    console.log('│  1. Obfuscate  - Light scramble, always recoverable (no key)        │');
-    console.log('│  2. Keychain   - AES-256 encryption, key in system keychain         │');
+    console.log('│  1. Scramble   - ⚠️ NOT ENCRYPTION! Reversible, no key needed        │');
+    console.log('│  2. Keychain   - AES-256 encryption, key in system keychain (SAFE)  │');
     console.log('│  3. Passphrase - AES-256 encryption, YOU manage the key (no rescue) │');
     console.log('└─────────────────────────────────────────────────────────────────────┘');
     console.log('');
@@ -208,6 +208,48 @@ const MODE_EXTENSIONS: Record<ProtectionMode, string> = {
   keychain: '.enc',
   passphrase: '.aes',
 };
+
+// ---------- Security Helpers ----------
+
+// Safe JSON parsing with friendly error messages
+function safeJsonParse<T>(content: string, context: string): T | null {
+  try {
+    return JSON.parse(content) as T;
+  } catch (e: any) {
+    console.error(`❌ Failed to parse ${context}: ${e.message}`);
+    console.error('   The file may be corrupted or malformed.');
+    return null;
+  }
+}
+
+// Path validation - prevents path traversal attacks
+function validateFilePath(filePath: string): { valid: boolean; resolved: string; error?: string } {
+  const resolved = path.resolve(filePath);
+  const homeDir = os.homedir();
+
+  // Must be within home directory
+  if (!resolved.startsWith(homeDir)) {
+    return { valid: false, resolved, error: 'File must be within home directory' };
+  }
+
+  // Check for symlinks (TOCTOU protection)
+  try {
+    const stats = fs.lstatSync(resolved);
+    if (stats.isSymbolicLink()) {
+      return { valid: false, resolved, error: 'Symlinks not allowed for security' };
+    }
+  } catch {
+    // File doesn't exist yet - that's OK for output files
+  }
+
+  return { valid: true, resolved };
+}
+
+// Mask sensitive tokens for display (shows first 4 and last 4 chars)
+function maskToken(token: string): string {
+  if (token.length <= 12) return '••••••••';
+  return token.slice(0, 4) + '••••••••••••••••••••••••••••••••••••••••••••••••••••' + token.slice(-4);
+}
 
 // ---------- Fibonacci Bloom Filter ----------
 class FibonacciBloomFilter {
@@ -787,7 +829,12 @@ class KokeshiBeanstalk {
       let currentConfig: any = {};
 
       if (configExists) {
-        currentConfig = JSON.parse(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'));
+        const parsed = safeJsonParse<any>(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'), 'clawdbot.json');
+        if (parsed === null) {
+          console.error('   Cannot proceed with corrupted config. Delete or fix the file.');
+          process.exit(1);
+        }
+        currentConfig = parsed;
       }
 
       // Build list of changes
@@ -881,17 +928,20 @@ class KokeshiBeanstalk {
       console.log('✅ Permissions set to 600 (owner-only)');
       console.log('');
       console.log('┌─────────────────────────────────────────────────────────────────────┐');
-      console.log('│  🔑 YOUR GATEWAY AUTH TOKEN (save this somewhere safe!)             │');
+      console.log('│  🔑 AUTH TOKEN GENERATED (masked for security)                      │');
       console.log('├─────────────────────────────────────────────────────────────────────┤');
-      console.log(`│  ${merged.gateway.auth.token}  │`);
+      console.log(`│  ${maskToken(merged.gateway.auth.token)}  │`);
+      console.log('├─────────────────────────────────────────────────────────────────────┤');
+      console.log('│  To view full token, run:                                           │');
+      console.log(`│  cat ${CLAWDBOT_CONFIG_PATH} | grep token            │`);
       console.log('└─────────────────────────────────────────────────────────────────────┘');
       console.log('');
 
       if (!skipPrompts) {
-        const saved = await wizard.confirm('Have you saved the token above?');
+        const saved = await wizard.confirm('Have you copied the token from the config file?');
         if (!saved) {
-          console.log('\n⚠️  Please save the token before closing this window!');
-          console.log('   You can also find it in: ' + CLAWDBOT_CONFIG_PATH);
+          console.log('\n⚠️  Copy the token before closing this window!');
+          console.log(`   Run: cat ${CLAWDBOT_CONFIG_PATH} | grep token`);
         }
       }
 
@@ -905,7 +955,11 @@ class KokeshiBeanstalk {
       console.log('');
 
       // Re-read and validate
-      const verifyConfig = JSON.parse(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'));
+      const verifyConfig = safeJsonParse<any>(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'), 'clawdbot.json (verify)');
+      if (verifyConfig === null) {
+        console.error('❌ Config file corrupted after save!');
+        process.exit(1);
+      }
       const validation = this.validateConfig(verifyConfig);
       const stats = fs.statSync(CLAWDBOT_CONFIG_PATH);
       const mode = (stats.mode & 0o777).toString(8);
@@ -964,7 +1018,18 @@ class KokeshiBeanstalk {
         points: 25
       });
     } else {
-      config = JSON.parse(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'));
+      const parsed = safeJsonParse<any>(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'), 'clawdbot.json');
+      if (parsed === null) {
+        findings.push({
+          severity: 'CRITICAL',
+          plain: 'Your config file is corrupted or malformed',
+          technical: 'clawdbot.json contains invalid JSON',
+          fix: 'Delete and recreate with: npx kokeshi-beanstalk harden',
+          points: 25
+        });
+      } else {
+        config = parsed;
+      }
 
       // Check 2: Config file permissions
       const stats = fs.statSync(CLAWDBOT_CONFIG_PATH);
@@ -1164,7 +1229,12 @@ class KokeshiBeanstalk {
 
     let config: any = {};
     if (fs.existsSync(CLAWDBOT_CONFIG_PATH)) {
-      config = JSON.parse(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'));
+      const parsed = safeJsonParse<any>(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'), 'clawdbot.json');
+      if (parsed === null) {
+        console.error('Cannot audit - config file is corrupted.');
+        return;
+      }
+      config = parsed;
     }
 
     const validation = this.validateConfig(config);
@@ -1337,8 +1407,12 @@ class KokeshiBeanstalk {
       if (selectedMode === 'obfuscate') {
         console.log('');
         console.log('┌─────────────────────────────────────────────────────────────────────┐');
-        console.log('│  ⚠️  OBFUSCATE ≠ ENCRYPTION                                          │');
-        console.log('│  This only stops casual viewing. Anyone with this tool can reverse. │');
+        console.log('│  ⚠️  SCRAMBLE MODE - THIS IS NOT ENCRYPTION!                         │');
+        console.log('├─────────────────────────────────────────────────────────────────────┤');
+        console.log('│  • Scramble is FULLY REVERSIBLE by anyone with this tool            │');
+        console.log('│  • Provides ZERO cryptographic security                             │');
+        console.log('│  • Only stops casual shoulder-surfing                               │');
+        console.log('│  • Use --secure (keychain) or --max (passphrase) for real security  │');
         console.log('└─────────────────────────────────────────────────────────────────────┘');
         console.log('');
       } else if (selectedMode === 'keychain') {
@@ -1411,12 +1485,6 @@ class KokeshiBeanstalk {
         const ext = MODE_EXTENSIONS[selectedMode];
         const outputPath = filePath + ext;
 
-        // Overwrite protection
-        if (fs.existsSync(outputPath) && !force) {
-          console.log(`⚠️  Skipped: ${path.basename(outputPath)} already exists (use --force)`);
-          continue;
-        }
-
         try {
           const content = fs.readFileSync(filePath, 'utf8');
           let protected_: string;
@@ -1433,7 +1501,17 @@ class KokeshiBeanstalk {
               break;
           }
 
-          fs.writeFileSync(outputPath, protected_);
+          // TOCTOU protection: use 'wx' flag (exclusive create, fails if exists)
+          // Use 'w' flag only with --force
+          try {
+            fs.writeFileSync(outputPath, protected_, { flag: force ? 'w' : 'wx' });
+          } catch (writeErr: any) {
+            if (writeErr.code === 'EEXIST') {
+              console.log(`⚠️  Skipped: ${path.basename(outputPath)} already exists (use --force)`);
+              continue;
+            }
+            throw writeErr;
+          }
           protectedFiles.push(outputPath);
 
           const verb = selectedMode === 'obfuscate' ? 'Obfuscated' : 'Encrypted';
@@ -1611,9 +1689,13 @@ class KokeshiBeanstalk {
             throw new Error('Unknown protection mode');
         }
 
+        // TOCTOU protection: check if output already exists
+        if (fs.existsSync(outputPath)) {
+          console.warn(`⚠️  Warning: ${path.basename(outputPath)} will be overwritten`);
+        }
         fs.writeFileSync(outputPath, decrypted);
 
-        const verb = mode === 'obfuscate' ? 'Deobfuscated' : 'Decrypted';
+        const verb = mode === 'obfuscate' ? 'Descrambled' : 'Decrypted';
         console.log(`✅ ${verb}: ${path.basename(filePath)} → ${path.basename(outputPath)}`);
         console.log('');
         console.log('┌─────────────────────────────────────────────────────────────────────┐');
@@ -1686,6 +1768,30 @@ const { command, jitter, secret, file, mode, force, yes } = parseFlags(args);
 const beanstalk = new KokeshiBeanstalk(jitter);
 
 (async () => {
+  // SECURITY: Deprecate --secret flag (visible in process list)
+  if (secret && !process.env.KOKESHI_SECRET) {
+    console.warn('');
+    console.warn('┌─────────────────────────────────────────────────────────────────────┐');
+    console.warn('│  ⚠️  SECURITY WARNING: --secret is deprecated                        │');
+    console.warn('├─────────────────────────────────────────────────────────────────────┤');
+    console.warn('│  Command-line secrets are visible in process listings (ps aux)     │');
+    console.warn('│  Use interactive prompt or KOKESHI_SECRET env var instead.         │');
+    console.warn('└─────────────────────────────────────────────────────────────────────┘');
+    console.warn('');
+  }
+
+  // SECURITY: Validate --file path (prevent path traversal)
+  let validatedFile = file;
+  if (file) {
+    const validation = validateFilePath(file);
+    if (!validation.valid) {
+      console.error(`❌ Invalid file path: ${validation.error}`);
+      console.error('   Files must be within your home directory and cannot be symlinks.');
+      process.exit(1);
+    }
+    validatedFile = validation.resolved;
+  }
+
   switch (command) {
     case 'scan':
       await beanstalk.scan();
@@ -1702,37 +1808,43 @@ const beanstalk = new KokeshiBeanstalk(jitter);
 
     // Protection commands
     case 'protect':
-      await beanstalk.protectFiles(mode, secret, file, force, yes);
+      await beanstalk.protectFiles(mode, secret || process.env.KOKESHI_SECRET, validatedFile, force, yes);
       break;
     case 'unprotect':
-      if (!file) {
+      if (!validatedFile) {
         console.error('Usage: kokeshi-beanstalk unprotect --file <path>');
         process.exit(1);
       }
-      await beanstalk.unprotectFile(file, secret, yes);
+      await beanstalk.unprotectFile(validatedFile, secret || process.env.KOKESHI_SECRET, yes);
       break;
 
     // Legacy commands (deprecated)
-    case 'encrypt':
-      if (!secret) {
+    case 'encrypt': {
+      const effectiveSecret = secret || process.env.KOKESHI_SECRET;
+      if (!effectiveSecret) {
         console.error('Usage: kokeshi-beanstalk encrypt --secret <passphrase>');
+        console.error('   Or set KOKESHI_SECRET environment variable');
         process.exit(1);
       }
-      if (file) {
-        SoulEncryption.encryptFile(file, secret);
+      if (validatedFile) {
+        SoulEncryption.encryptFile(validatedFile, effectiveSecret);
       } else {
         console.warn('⚠️  DEPRECATION WARNING: "encrypt" is deprecated.');
-        console.warn('   Use "protect --mode passphrase --secret <pass>" instead.\n');
-        await beanstalk.protectFiles('passphrase', secret, undefined, force, yes);
+        console.warn('   Use "protect --mode passphrase" instead.\n');
+        await beanstalk.protectFiles('passphrase', effectiveSecret, undefined, force, yes);
       }
       break;
-    case 'decrypt':
-      if (!secret || !file) {
+    }
+    case 'decrypt': {
+      const effectiveSecret = secret || process.env.KOKESHI_SECRET;
+      if (!effectiveSecret || !validatedFile) {
         console.error('Usage: kokeshi-beanstalk decrypt --secret <passphrase> --file <path>');
+        console.error('   Or set KOKESHI_SECRET environment variable');
         process.exit(1);
       }
-      SoulEncryption.decryptFile(file, secret);
+      SoulEncryption.decryptFile(validatedFile, effectiveSecret);
       break;
+    }
 
     default:
       console.log(`
