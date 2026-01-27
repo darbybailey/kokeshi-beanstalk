@@ -100,7 +100,8 @@ class SoulEncryption {
 
   static encrypt(content: string, secret: string): string {
     const salt = crypto.randomBytes(16);
-    const key = scryptSync(secret, salt, 32);
+    // N=2^14, r=8, p=1 for stronger key derivation (~25ms)
+    const key = scryptSync(secret, salt, 32, { N: 16384, r: 8, p: 1 });
     const iv = crypto.randomBytes(16);
     const cipher = createCipheriv(this.ALGORITHM, key, iv);
     let encrypted = cipher.update(content, 'utf8', 'hex');
@@ -112,7 +113,8 @@ class SoulEncryption {
     const [saltHex, ivHex, encrypted] = encryptedData.split(':');
     const salt = Buffer.from(saltHex, 'hex');
     const iv = Buffer.from(ivHex, 'hex');
-    const key = scryptSync(secret, salt, 32);
+    // N=2^14, r=8, p=1 for stronger key derivation (~25ms)
+    const key = scryptSync(secret, salt, 32, { N: 16384, r: 8, p: 1 });
     const decipher = createDecipheriv(this.ALGORITHM, key, iv);
     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
@@ -210,7 +212,10 @@ class KokeshiBeanstalk {
     const fibVariation = fib((this.primeIdx % 15) + 4);
     this.primeIdx++;
 
-    let interval = primeBase * this.jitterConfig.primeMultiplier + fibVariation * this.jitterConfig.fibMultiplier;
+    // Add cryptographic entropy to break predictable patterns
+    const entropy = crypto.randomBytes(2).readUInt16BE(0) % 500;
+
+    let interval = primeBase * this.jitterConfig.primeMultiplier + fibVariation * this.jitterConfig.fibMultiplier + entropy;
     interval = Math.max(interval, this.jitterConfig.minMs);
     interval = Math.min(interval, this.jitterConfig.maxMs);
     return interval;
@@ -258,6 +263,8 @@ class KokeshiBeanstalk {
 
     const merged = { ...HARDENED_CONFIG, ...config };
     fs.writeFileSync(CLAWDBOT_CONFIG_PATH, JSON.stringify(merged, null, 2));
+    // Restrict config to owner-only (chmod 600)
+    fs.chmodSync(CLAWDBOT_CONFIG_PATH, 0o600);
 
     const validation = this.validateConfig(merged);
     console.log(`Config ${existing ? 'updated' : 'created'} at ${CLAWDBOT_CONFIG_PATH}`);
