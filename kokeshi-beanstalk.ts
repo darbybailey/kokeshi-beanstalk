@@ -211,14 +211,61 @@ const MODE_EXTENSIONS: Record<ProtectionMode, string> = {
 
 // ---------- Security Helpers ----------
 
-// Safe JSON parsing with friendly error messages
+// Maximum header size to prevent DoS (64KB should be more than enough)
+const MAX_HEADER_SIZE = 64 * 1024;
+
+// Passphrase attempt tracking for brute-force protection
+const passphraseAttempts: Map<string, { count: number; lastAttempt: number }> = new Map();
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 30000; // 30 second lockout after max attempts
+
+// Strip prototype pollution vectors from parsed JSON
+function stripPollution(obj: any): any {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(stripPollution);
+
+  const clean: any = {};
+  for (const key of Object.keys(obj)) {
+    // Skip dangerous prototype pollution keys
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      continue;
+    }
+    clean[key] = stripPollution(obj[key]);
+  }
+  return clean;
+}
+
+// Safe JSON parsing with friendly error messages and pollution protection
 function safeJsonParse<T>(content: string, context: string): T | null {
   try {
-    return JSON.parse(content) as T;
+    const parsed = JSON.parse(content);
+    return stripPollution(parsed) as T;
   } catch (e: any) {
     console.error(`❌ Failed to parse ${context}: ${e.message}`);
     console.error('   The file may be corrupted or malformed.');
     return null;
+  }
+}
+
+// Check if path is safe for file operations (symlink + hardlink protection)
+function isPathSafe(filePath: string): { safe: boolean; error?: string } {
+  try {
+    const stats = fs.lstatSync(filePath);
+
+    // Reject symlinks
+    if (stats.isSymbolicLink()) {
+      return { safe: false, error: 'Symlinks not allowed for security' };
+    }
+
+    // Reject hardlinks (nlink > 1 means multiple links to same inode)
+    if (stats.nlink > 1) {
+      return { safe: false, error: 'Hardlinks not allowed for security' };
+    }
+
+    return { safe: true };
+  } catch {
+    // File doesn't exist - that's OK for new files
+    return { safe: true };
   }
 }
 
@@ -232,23 +279,73 @@ function validateFilePath(filePath: string): { valid: boolean; resolved: string;
     return { valid: false, resolved, error: 'File must be within home directory' };
   }
 
-  // Check for symlinks (TOCTOU protection)
-  try {
-    const stats = fs.lstatSync(resolved);
-    if (stats.isSymbolicLink()) {
-      return { valid: false, resolved, error: 'Symlinks not allowed for security' };
-    }
-  } catch {
-    // File doesn't exist yet - that's OK for output files
+  // Check for symlinks and hardlinks
+  const safety = isPathSafe(resolved);
+  if (!safety.safe) {
+    return { valid: false, resolved, error: safety.error };
   }
 
   return { valid: true, resolved };
+}
+
+// Safe file write with TOCTOU protection
+// Re-checks path safety immediately before write to close race window
+function safeWriteFile(filePath: string, content: string, options: { force?: boolean } = {}): { success: boolean; error?: string } {
+  // Re-check path safety right before write (closes TOCTOU window)
+  const safety = isPathSafe(filePath);
+  if (!safety.safe) {
+    return { success: false, error: safety.error };
+  }
+
+  try {
+    // Use 'wx' for exclusive create (O_CREAT | O_EXCL)
+    // Use 'w' only with --force
+    fs.writeFileSync(filePath, content, { flag: options.force ? 'w' : 'wx' });
+    return { success: true };
+  } catch (e: any) {
+    if (e.code === 'EEXIST') {
+      return { success: false, error: 'File already exists (use --force)' };
+    }
+    return { success: false, error: e.message };
+  }
 }
 
 // Mask sensitive tokens for display (shows first 4 and last 4 chars)
 function maskToken(token: string): string {
   if (token.length <= 12) return '••••••••';
   return token.slice(0, 4) + '••••••••••••••••••••••••••••••••••••••••••••••••••••' + token.slice(-4);
+}
+
+// Passphrase attempt throttling (brute-force protection)
+function checkPassphraseThrottle(identifier: string): { allowed: boolean; waitMs?: number } {
+  const now = Date.now();
+  const record = passphraseAttempts.get(identifier);
+
+  if (record) {
+    // Check if lockout has expired
+    if (record.count >= MAX_ATTEMPTS) {
+      const elapsed = now - record.lastAttempt;
+      if (elapsed < LOCKOUT_MS) {
+        return { allowed: false, waitMs: LOCKOUT_MS - elapsed };
+      }
+      // Lockout expired, reset
+      passphraseAttempts.delete(identifier);
+    }
+  }
+
+  return { allowed: true };
+}
+
+function recordPassphraseAttempt(identifier: string, success: boolean): void {
+  if (success) {
+    passphraseAttempts.delete(identifier);
+    return;
+  }
+
+  const record = passphraseAttempts.get(identifier) || { count: 0, lastAttempt: 0 };
+  record.count++;
+  record.lastAttempt = Date.now();
+  passphraseAttempts.set(identifier, record);
 }
 
 // ---------- Fibonacci Bloom Filter ----------
@@ -440,15 +537,44 @@ class FileProtection {
     return `${MAGIC_HEADER}\n${JSON.stringify(header)}\n`;
   }
 
-  // Parse header from protected file
+  // Parse header from protected file (with DoS protection)
   static parseHeader(data: string): { header: ProtectionHeader; payload: string } | null {
-    const lines = data.split('\n');
-    if (lines.length < 3 || lines[0] !== MAGIC_HEADER) {
+    // DoS protection: limit header search area
+    // Header should be in first few hundred bytes, not megabytes
+    const headerSearchLimit = Math.min(data.length, MAX_HEADER_SIZE);
+    const headerArea = data.slice(0, headerSearchLimit);
+
+    // Find first two newlines within the safe area
+    const firstNewline = headerArea.indexOf('\n');
+    if (firstNewline === -1 || firstNewline > 10) return null; // Magic header should be < 10 chars
+
+    const secondNewline = headerArea.indexOf('\n', firstNewline + 1);
+    if (secondNewline === -1 || secondNewline > 1024) return null; // Header JSON should be < 1KB
+
+    const magic = data.slice(0, firstNewline);
+    if (magic !== MAGIC_HEADER) {
       return null;
     }
+
+    const headerJson = data.slice(firstNewline + 1, secondNewline);
+
+    // Reject oversized header JSON (prevent JSON parsing DoS)
+    if (headerJson.length > 1024) {
+      return null;
+    }
+
     try {
-      const header: ProtectionHeader = JSON.parse(lines[1]);
-      const payload = lines.slice(2).join('\n');
+      const header: ProtectionHeader = JSON.parse(headerJson);
+
+      // Validate header fields exist and are reasonable
+      if (!header.version || !header.mode || !header.createdAt) {
+        return null;
+      }
+      if (!['obfuscate', 'keychain', 'passphrase'].includes(header.mode)) {
+        return null;
+      }
+
+      const payload = data.slice(secondNewline + 1);
       return { header, payload };
     } catch {
       return null;
@@ -1501,20 +1627,20 @@ class KokeshiBeanstalk {
               break;
           }
 
-          // TOCTOU protection: use 'wx' flag (exclusive create, fails if exists)
-          // Use 'w' flag only with --force
-          try {
-            fs.writeFileSync(outputPath, protected_, { flag: force ? 'w' : 'wx' });
-          } catch (writeErr: any) {
-            if (writeErr.code === 'EEXIST') {
-              console.log(`⚠️  Skipped: ${path.basename(outputPath)} already exists (use --force)`);
-              continue;
+          // TOCTOU protection: re-check path safety immediately before write
+          // Closes race window between initial validation and file write
+          const writeResult = safeWriteFile(outputPath, protected_, { force });
+          if (!writeResult.success) {
+            if (writeResult.error?.includes('already exists')) {
+              console.log(`⚠️  Skipped: ${path.basename(outputPath)} - ${writeResult.error}`);
+            } else {
+              console.error(`❌ Blocked: ${path.basename(outputPath)} - ${writeResult.error}`);
             }
-            throw writeErr;
+            continue;
           }
           protectedFiles.push(outputPath);
 
-          const verb = selectedMode === 'obfuscate' ? 'Obfuscated' : 'Encrypted';
+          const verb = selectedMode === 'obfuscate' ? 'Scrambled' : 'Encrypted';
           console.log(`✅ ${verb}: ${path.basename(filePath)} → ${path.basename(outputPath)}`);
         } catch (e: any) {
           console.error(`❌ Failed: ${filePath} - ${e.message}`);
@@ -1672,6 +1798,21 @@ class KokeshiBeanstalk {
       console.log('═══════════════════════════════════════════════════════════════════════');
       console.log('');
 
+      // Brute-force protection for passphrase mode
+      if (mode === 'passphrase') {
+        const throttle = checkPassphraseThrottle(filePath);
+        if (!throttle.allowed) {
+          console.error('');
+          console.error('┌─────────────────────────────────────────────────────────────────────┐');
+          console.error('│  ⏳ TOO MANY FAILED ATTEMPTS                                         │');
+          console.error('├─────────────────────────────────────────────────────────────────────┤');
+          console.error(`│  Please wait ${Math.ceil((throttle.waitMs || 0) / 1000)} seconds before trying again.                       │`);
+          console.error('│  This protects against brute-force attacks.                        │');
+          console.error('└─────────────────────────────────────────────────────────────────────┘');
+          process.exit(1);
+        }
+      }
+
       try {
         let decrypted: string;
 
@@ -1684,12 +1825,19 @@ class KokeshiBeanstalk {
             break;
           case 'passphrase':
             decrypted = FileProtection.decryptPassphrase(content, passphrase!);
+            // Record successful attempt (clears throttle)
+            recordPassphraseAttempt(filePath, true);
             break;
           default:
             throw new Error('Unknown protection mode');
         }
 
-        // TOCTOU protection: check if output already exists
+        // TOCTOU protection: re-check before write
+        const writeCheck = isPathSafe(outputPath);
+        if (!writeCheck.safe) {
+          console.error(`❌ Blocked: ${writeCheck.error}`);
+          process.exit(1);
+        }
         if (fs.existsSync(outputPath)) {
           console.warn(`⚠️  Warning: ${path.basename(outputPath)} will be overwritten`);
         }
@@ -1703,6 +1851,11 @@ class KokeshiBeanstalk {
         console.log('│  You can now safely delete the protected file if desired.          │');
         console.log('└─────────────────────────────────────────────────────────────────────┘');
       } catch (e: any) {
+        // Record failed attempt for passphrase mode
+        if (mode === 'passphrase') {
+          recordPassphraseAttempt(filePath, false);
+        }
+
         console.log('');
         if (e.message.includes('auth') || e.message.includes('Unsupported state')) {
           console.error('❌ DECRYPTION FAILED: Authentication error');
@@ -1768,15 +1921,27 @@ const { command, jitter, secret, file, mode, force, yes } = parseFlags(args);
 const beanstalk = new KokeshiBeanstalk(jitter);
 
 (async () => {
-  // SECURITY: Deprecate --secret flag (visible in process list)
+  // SECURITY: --secret flag requires --force (visible in process list)
   if (secret && !process.env.KOKESHI_SECRET) {
+    if (!force) {
+      console.error('');
+      console.error('┌─────────────────────────────────────────────────────────────────────┐');
+      console.error('│  ❌ --secret is BLOCKED (visible in process listings)               │');
+      console.error('├─────────────────────────────────────────────────────────────────────┤');
+      console.error('│  Command-line secrets appear in: ps aux, /proc/*/cmdline, logs     │');
+      console.error('│                                                                     │');
+      console.error('│  Safe alternatives:                                                 │');
+      console.error('│    • Interactive prompt (just omit --secret)                       │');
+      console.error('│    • KOKESHI_SECRET=xxx npx kokeshi-beanstalk ...                  │');
+      console.error('│                                                                     │');
+      console.error('│  To force insecure mode: add --force                               │');
+      console.error('└─────────────────────────────────────────────────────────────────────┘');
+      console.error('');
+      process.exit(1);
+    }
+    // With --force, show warning but continue
     console.warn('');
-    console.warn('┌─────────────────────────────────────────────────────────────────────┐');
-    console.warn('│  ⚠️  SECURITY WARNING: --secret is deprecated                        │');
-    console.warn('├─────────────────────────────────────────────────────────────────────┤');
-    console.warn('│  Command-line secrets are visible in process listings (ps aux)     │');
-    console.warn('│  Use interactive prompt or KOKESHI_SECRET env var instead.         │');
-    console.warn('└─────────────────────────────────────────────────────────────────────┘');
+    console.warn('⚠️  Using --secret with --force (insecure - visible in process list)');
     console.warn('');
   }
 
