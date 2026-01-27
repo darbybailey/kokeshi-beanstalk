@@ -50,6 +50,40 @@ This creates a non-harmonic, unpredictable monitoring pattern that is mathematic
 
 Tracks suspicious connection attempts using a space-efficient probabilistic data structure. It remembers repeat probes without needing a heavy database.
 
+## 🧠 Security Model: Entropy vs. Pattern
+
+Kokeshi Beanstalk uses a two-layer timing defense based on **Kerckhoffs's Principle**: the algorithm is public, but the entropy is private.
+
+### Layer 1: The Weave (Coverage)
+The Prime-Fibonacci slapback algorithm ensures monitoring intervals are distributed non-linearly across the time spectrum. This prevents **harmonic resonance** — the predictable gaps that occur with fixed-interval monitoring (e.g., checking every 10 seconds allows attackers to safely probe at second 11).
+
+* **Prime numbers** provide gap-free coverage.
+* **Fibonacci variation** adds amplitude diversity.
+* **Figure-8 slapback** prevents linear sequence prediction.
+* **φ (phi)** amplitude minimizes harmonic patterns.
+
+### Layer 2: The Noise (Unpredictability)
+The actual trigger time is non-deterministic. Even with full knowledge of the source code and current cycle state, an attacker cannot predict the next check due to multiple runtime entropy sources:
+
+| Source | Entropy | Notes |
+| :--- | :--- | :--- |
+| `crypto.randomBytes(2)` | 0–500ms | CSPRNG-derived true random |
+| `process.hrtime()[1]` | 0–100ns | CPU nanosecond jitter |
+| **Temporal Drift** | ×17 daily variants | Based on server clock state |
+
+**Combined entropy space:** ~42 million possible intervals per base value.
+
+### What This Means
+
+| With Source Code, Attacker Knows | Attacker Still Cannot Know |
+| :--- | :--- |
+| The prime weave pattern | Your CSPRNG state |
+| The phi-derived amplitude | Your CPU's nanosecond counter |
+| The slapback depth (144) | Your exact server clock |
+| The formula structure | **The next interval** |
+
+> **Result:** The algorithm determines the *window* of the check. Entropy determines the *exact moment*. This makes timing attacks computationally infeasible — not because the math is secret, but because the randomness is real.
+
 ## Usage
 
 ### Harden Configuration
