@@ -130,7 +130,7 @@ Don't want to fix manually? Run: npx kokeshi-beanstalk harden
 
 ### Harden Configuration (Guided Wizard)
 
-Interactive 3-step wizard that explains changes, asks permission, then applies them.
+Interactive 4-step wizard that explains changes, asks permission, applies them, and verifies success.
 
 ```bash
 npx kokeshi-beanstalk harden
@@ -140,11 +140,14 @@ npx kokeshi-beanstalk harden
 1. **Step 1 (Explain)** - Shows exactly what will change
 2. **Step 2 (Confirm)** - Asks "Ready to apply these changes?"
 3. **Step 3 (Execute)** - Applies changes, shows token, confirms you saved it
+4. **Step 4 (Verify)** - Re-validates config to confirm success
 
 **For automation (CI/CD, scripts):**
 ```bash
-npx kokeshi-beanstalk harden --yes    # Skip all prompts
+npx kokeshi-beanstalk harden --yes    # Skip prompts, but still shows explanations
 ```
+
+> **Note:** The `--yes` flag skips *prompts* but NOT *explanations*. This ensures auditable logs even in CI/CD pipelines.
 
 ### 🔐 File Protection (Guided Wizard)
 
@@ -159,7 +162,9 @@ npx kokeshi-beanstalk protect --max     # Passphrase mode (prompts for password)
 **The wizard flow:**
 1. **Step 1 (Explain)** - Shows files found, explains protection levels
 2. **Step 2 (Confirm)** - You pick mode; passphrase requires double-entry + "I UNDERSTAND"
-3. **Step 3 (Execute)** - Protects files, reminds you to test decrypt before deleting originals
+3. **Step 3 (Execute)** - Protects files, offers to test unprotect immediately
+
+**Safety net:** After protecting files, the wizard offers "Test unprotect now? [Y/n]" to verify you can recover your data before deleting originals.
 
 **Protection Levels:**
 
@@ -196,6 +201,25 @@ npx kokeshi-beanstalk monitor --jitter-min 1000 --jitter-max 30000
 ```bash
 npm install -g kokeshi-beanstalk
 ```
+
+## Design Principles
+
+### Guided Wizard UX
+
+**Principle (testable):**
+> "Any command that mutates system state MUST execute an explicit Explain → Confirm → Execute flow, unless `--yes` is provided."
+
+**Why this rule exists:**
+1. **Prevent silent failure** - Explanations ensure you know what *should* happen, so you can detect when something goes wrong
+2. **Prevent accidental lockout** - Confirmations catch typos and misunderstandings before they become irreversible
+3. **Prevent irreversible mistakes** - Dangerous actions require typing "I UNDERSTAND" to prove intent
+
+**STATE CHANGE** includes: file writes, permission changes, key generation, service registration, network rule changes, background processes, or deletion.
+
+**The `--yes` flag:**
+- Skips *prompts* (confirmations, mode selection)
+- Does NOT skip *explanations* (Step 1 is always shown)
+- Ensures auditable logs even in CI/CD pipelines
 
 ## Security Coverage
 

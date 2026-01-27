@@ -16,11 +16,19 @@ import { execSync } from 'child_process';
 import readline from 'readline';
 
 // ---------- Wizard (Interactive UX) ----------
-// "Kokeshi Beanstalk never changes system state without explaining
-// what will happen, asking permission, and confirming success."
+// PRINCIPLE (testable):
+// "Any command that mutates system state MUST execute an explicit
+// Explain → Confirm → Execute flow, unless --yes is provided."
+//
+// STATE CHANGE includes: file writes, permission changes, key generation,
+// service registration, network rule changes, background processes, or deletion.
+//
+// This rule exists to prevent silent failure, accidental lockout,
+// and irreversible mistakes.
 
 class Wizard {
   private rl: readline.Interface | null = null;
+  private rawModeWas: boolean | undefined = undefined;
 
   private getRL(): readline.Interface {
     if (!this.rl) {
@@ -32,6 +40,18 @@ class Wizard {
     return this.rl;
   }
 
+  // Structured Step 1 display - always shown even with --yes
+  explain(title: string, step: string, content: string[]): void {
+    console.log('');
+    console.log('╔═══════════════════════════════════════════════════════════════════════╗');
+    console.log(`║  ${title.padEnd(68)}║`);
+    console.log(`║  ${step.padEnd(68)}║`);
+    console.log('╚═══════════════════════════════════════════════════════════════════════╝');
+    console.log('');
+    content.forEach(line => console.log(line));
+    console.log('');
+  }
+
   async confirm(question: string): Promise<boolean> {
     return new Promise((resolve) => {
       this.getRL().question(`${question} (yes/no): `, (answer) => {
@@ -40,33 +60,52 @@ class Wizard {
     });
   }
 
-  async askSecret(question: string): Promise<string> {
+  // Dangerous action confirmation - requires typing "I UNDERSTAND" exactly
+  async confirmDanger(): Promise<boolean> {
+    console.log('');
+    console.log('┌─────────────────────────────────────────────────────────────────────┐');
+    console.log('│  ⚠️  THIS ACTION IS IRREVERSIBLE                                     │');
+    console.log('│  Type "I UNDERSTAND" to proceed, or anything else to cancel.        │');
+    console.log('└─────────────────────────────────────────────────────────────────────┘');
+    console.log('');
     return new Promise((resolve) => {
-      const rl = this.getRL();
+      this.getRL().question('> ', (answer) => {
+        resolve(answer === 'I UNDERSTAND');
+      });
+    });
+  }
 
+  async askSecret(question: string): Promise<string> {
+    return new Promise((resolve, reject) => {
       // Disable echo for password input
       if (process.stdin.isTTY) {
         process.stdout.write(`${question}: `);
         const stdin = process.stdin;
-        const wasRaw = stdin.isRaw;
+        this.rawModeWas = stdin.isRaw;
         stdin.setRawMode(true);
 
         let password = '';
+        const cleanup = () => {
+          stdin.setRawMode(this.rawModeWas || false);
+          stdin.removeListener('data', onData);
+          process.stdout.write('\n');
+        };
+
         const onData = (char: Buffer) => {
           const c = char.toString();
           if (c === '\n' || c === '\r') {
-            stdin.setRawMode(wasRaw || false);
-            stdin.removeListener('data', onData);
-            process.stdout.write('\n');
+            cleanup();
             resolve(password);
-          } else if (c === '\u0003') { // Ctrl+C
+          } else if (c === '\u0003') { // Ctrl+C - clean exit
+            cleanup();
+            console.log('\n❌ Cancelled by user.');
             process.exit(0);
           } else if (c === '\u007F' || c === '\b') { // Backspace
             if (password.length > 0) {
               password = password.slice(0, -1);
               process.stdout.write('\b \b');
             }
-          } else {
+          } else if (c.charCodeAt(0) >= 32) { // Printable characters only
             password += c;
             process.stdout.write('*');
           }
@@ -74,7 +113,7 @@ class Wizard {
         stdin.on('data', onData);
       } else {
         // Non-TTY fallback (piped input)
-        rl.question(`${question}: `, resolve);
+        this.getRL().question(`${question}: `, resolve);
       }
     });
   }
@@ -106,15 +145,11 @@ class Wizard {
     });
   }
 
-  async requireConfirmation(text: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      this.getRL().question(`Type "${text}" to confirm: `, (answer) => {
-        resolve(answer === text);
-      });
-    });
-  }
-
   close(): void {
+    // Ensure terminal is restored if we were in raw mode
+    if (process.stdin.isTTY && this.rawModeWas !== undefined) {
+      try { process.stdin.setRawMode(this.rawModeWas); } catch {}
+    }
     if (this.rl) {
       this.rl.close();
       this.rl = null;
@@ -705,73 +740,63 @@ class KokeshiBeanstalk {
     return result;
   }
 
+  // STATE CHANGE: file writes, permission changes, key generation
   async hardenConfig(skipPrompts: boolean = false): Promise<void> {
     const wizard = new Wizard();
 
     try {
       // ═══════════════════════════════════════════════════════════════════════
-      // STEP 1: EXPLAIN - Show what will change
+      // STEP 1: EXPLAIN - Always shown, even with --yes (auditable logs)
       // ═══════════════════════════════════════════════════════════════════════
-      console.log('');
-      console.log('╔═══════════════════════════════════════════════════════════════════════╗');
-      console.log('║              KOKESHI BEANSTALK - HARDEN CONFIG                        ║');
-      console.log('║                     Step 1 of 3: Review Changes                       ║');
-      console.log('╚═══════════════════════════════════════════════════════════════════════╝');
-      console.log('');
-
       const configExists = fs.existsSync(CLAWDBOT_CONFIG_PATH);
       let currentConfig: any = {};
 
       if (configExists) {
         currentConfig = JSON.parse(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'));
-        console.log('📄 Existing config found. The following changes will be applied:');
-      } else {
-        console.log('📄 No config found. A new secure config will be created:');
       }
 
-      console.log('');
-      console.log('┌─────────────────────────────────────────────────────────────────────┐');
-
-      // Show what will change
+      // Build list of changes
       const changes: string[] = [];
-
       if (currentConfig.gateway?.bind !== '127.0.0.1') {
-        changes.push('  • Bind gateway to 127.0.0.1 (localhost only)');
+        changes.push('• Bind gateway to 127.0.0.1 (localhost only)');
       }
       if (currentConfig.gateway?.auth?.mode !== 'token') {
-        changes.push('  • Enable token authentication');
+        changes.push('• Enable token authentication');
       }
       if (!currentConfig.gateway?.auth?.token) {
-        changes.push('  • Generate new 256-bit auth token');
+        changes.push('• Generate new 256-bit auth token');
       }
       if (currentConfig.gateway?.tailscale?.mode !== 'off') {
-        changes.push('  • Disable Tailscale exposure');
+        changes.push('• Disable Tailscale exposure');
       }
       if (currentConfig.channels?.dmPolicy !== 'pairing') {
-        changes.push('  • Set DM policy to "pairing"');
+        changes.push('• Set DM policy to "pairing"');
       }
       if (currentConfig.agents?.defaults?.sandbox?.mode !== 'all') {
-        changes.push('  • Enable sandbox mode for all agents');
+        changes.push('• Enable sandbox mode for all agents');
       }
-      changes.push('  • Set file permissions to 600 (owner-only)');
+      changes.push('• Set file permissions to 600 (owner-only)');
 
-      if (changes.length === 1) {
-        console.log('│  ✅ Config is already secure. Only permission check needed.         │');
-      } else {
-        changes.forEach(c => console.log('│' + c.padEnd(72) + '│'));
-      }
+      const explainContent = [
+        configExists ? '📄 Existing config found. Changes to be applied:' : '📄 No config found. A new secure config will be created:',
+        '',
+        '┌─────────────────────────────────────────────────────────────────────┐',
+        ...(changes.length === 1
+          ? ['│  ✅ Config is already secure. Only permission check needed.         │']
+          : changes.map(c => '│  ' + c.padEnd(68) + '│')),
+        '└─────────────────────────────────────────────────────────────────────┘',
+        '',
+        `📁 Config path: ${CLAWDBOT_CONFIG_PATH}`,
+      ];
 
-      console.log('└─────────────────────────────────────────────────────────────────────┘');
-      console.log('');
-      console.log(`📁 Config path: ${CLAWDBOT_CONFIG_PATH}`);
-      console.log('');
+      wizard.explain('KOKESHI BEANSTALK - HARDEN CONFIG', 'Step 1 of 4: Review Changes', explainContent);
 
       // ═══════════════════════════════════════════════════════════════════════
-      // STEP 2: CONFIRM - Ask permission
+      // STEP 2: CONFIRM - Skipped with --yes
       // ═══════════════════════════════════════════════════════════════════════
       if (!skipPrompts) {
         console.log('═══════════════════════════════════════════════════════════════════════');
-        console.log('                     Step 2 of 3: Confirm Changes                      ');
+        console.log('                     Step 2 of 4: Confirm Changes                       ');
         console.log('═══════════════════════════════════════════════════════════════════════');
         console.log('');
 
@@ -780,14 +805,16 @@ class KokeshiBeanstalk {
           console.log('\n❌ Cancelled. No changes were made.');
           return;
         }
+      } else {
+        console.log('[--yes] Skipping confirmation prompt');
       }
 
       // ═══════════════════════════════════════════════════════════════════════
-      // STEP 3: EXECUTE - Apply changes and confirm success
+      // STEP 3: EXECUTE - Apply changes
       // ═══════════════════════════════════════════════════════════════════════
       console.log('');
       console.log('═══════════════════════════════════════════════════════════════════════');
-      console.log('                     Step 3 of 3: Applying Changes                      ');
+      console.log('                     Step 3 of 4: Applying Changes                       ');
       console.log('═══════════════════════════════════════════════════════════════════════');
       console.log('');
 
@@ -827,14 +854,52 @@ class KokeshiBeanstalk {
 
       if (!skipPrompts) {
         const saved = await wizard.confirm('Have you saved the token above?');
-        if (saved) {
-          console.log('\n✅ Hardening complete! Your Clawdbot is now secured.');
-        } else {
+        if (!saved) {
           console.log('\n⚠️  Please save the token before closing this window!');
           console.log('   You can also find it in: ' + CLAWDBOT_CONFIG_PATH);
         }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 4: VERIFY - Re-run minimal audit to confirm success
+      // ═══════════════════════════════════════════════════════════════════════
+      console.log('');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('                     Step 4 of 4: Verify                                ');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('');
+
+      // Re-read and validate
+      const verifyConfig = JSON.parse(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'));
+      const validation = this.validateConfig(verifyConfig);
+      const stats = fs.statSync(CLAWDBOT_CONFIG_PATH);
+      const mode = (stats.mode & 0o777).toString(8);
+
+      const checks = [
+        { name: 'Gateway bound to localhost', pass: verifyConfig.gateway?.bind === '127.0.0.1' },
+        { name: 'Token auth enabled', pass: verifyConfig.gateway?.auth?.mode === 'token' },
+        { name: 'Auth token present', pass: !!verifyConfig.gateway?.auth?.token },
+        { name: 'File permissions 600', pass: mode === '600' },
+        { name: 'Config validation', pass: validation.valid },
+      ];
+
+      let allPass = true;
+      checks.forEach(c => {
+        console.log(`  ${c.pass ? '✔' : '✘'} ${c.name}`);
+        if (!c.pass) allPass = false;
+      });
+
+      console.log('');
+      if (allPass) {
+        console.log('┌─────────────────────────────────────────────────────────────────────┐');
+        console.log('│  ✔ HARDEN SUCCESSFUL                                                │');
+        console.log('│  Your Clawdbot is now secured.                                      │');
+        console.log('└─────────────────────────────────────────────────────────────────────┘');
       } else {
-        console.log('✅ Hardening complete (automated mode).');
+        console.log('┌─────────────────────────────────────────────────────────────────────┐');
+        console.log('│  ⚠️  VERIFICATION FAILED                                             │');
+        console.log('│  Some checks did not pass. Please review and retry.                │');
+        console.log('└─────────────────────────────────────────────────────────────────────┘');
       }
     } finally {
       wizard.close();
@@ -1182,20 +1247,11 @@ class KokeshiBeanstalk {
     } catch {}
   }
 
+  // STATE CHANGE: file writes (encrypts files, creates new .obf/.enc/.aes files)
   async protectFiles(mode: ProtectionMode | undefined, secret?: string, file?: string, force?: boolean, skipPrompts?: boolean): Promise<void> {
     const wizard = new Wizard();
 
     try {
-      // ═══════════════════════════════════════════════════════════════════════
-      // STEP 1: EXPLAIN - Show what will be protected
-      // ═══════════════════════════════════════════════════════════════════════
-      console.log('');
-      console.log('╔═══════════════════════════════════════════════════════════════════════╗');
-      console.log('║              KOKESHI BEANSTALK - PROTECT FILES                        ║');
-      console.log('║                     Step 1 of 3: Review Files                         ║');
-      console.log('╚═══════════════════════════════════════════════════════════════════════╝');
-      console.log('');
-
       const sensitiveFiles = file ? [file] : [
         path.join(CLAWD_WORKSPACE, 'MEMORY.md'),
         path.join(CLAWD_WORKSPACE, 'SOUL.md'),
@@ -1212,15 +1268,22 @@ class KokeshiBeanstalk {
         return;
       }
 
-      console.log('📁 Files to protect:');
-      existingFiles.forEach(f => {
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 1: EXPLAIN - Always shown, even with --yes (auditable logs)
+      // ═══════════════════════════════════════════════════════════════════════
+      const fileList = existingFiles.map(f => {
         const size = fs.statSync(f).size;
-        console.log(`   • ${path.basename(f)} (${(size / 1024).toFixed(1)} KB)`);
+        return `   • ${path.basename(f)} (${(size / 1024).toFixed(1)} KB)`;
       });
-      console.log('');
+
+      wizard.explain(
+        'KOKESHI BEANSTALK - PROTECT FILES',
+        'Step 1 of 3: Review Files',
+        ['📁 Files to protect:', ...fileList]
+      );
 
       // ═══════════════════════════════════════════════════════════════════════
-      // STEP 2: CONFIRM - Choose mode and confirm
+      // STEP 2: CONFIRM - Choose mode and confirm (skipped with --yes)
       // ═══════════════════════════════════════════════════════════════════════
       console.log('═══════════════════════════════════════════════════════════════════════');
       console.log('                     Step 2 of 3: Choose Protection                     ');
@@ -1231,9 +1294,11 @@ class KokeshiBeanstalk {
 
       if (!skipPrompts && !mode) {
         selectedMode = await wizard.selectMode();
+      } else if (skipPrompts && !mode) {
+        console.log('[--yes] Using default mode: obfuscate');
       }
 
-      // Mode-specific handling
+      // Mode-specific warnings (always shown for awareness)
       if (selectedMode === 'obfuscate') {
         console.log('');
         console.log('┌─────────────────────────────────────────────────────────────────────┐');
@@ -1272,7 +1337,7 @@ class KokeshiBeanstalk {
             }
           }
 
-          const understood = await wizard.requireConfirmation('I UNDERSTAND');
+          const understood = await wizard.confirmDanger();
           if (!understood) {
             console.log('\n❌ Cancelled. You must type "I UNDERSTAND" to proceed.');
             return;
@@ -1284,11 +1349,16 @@ class KokeshiBeanstalk {
       }
 
       if (!skipPrompts) {
+        console.log('');
+        console.log('💡 We recommend testing unprotect immediately after to verify recovery.');
+        console.log('');
         const proceed = await wizard.confirm(`Protect ${existingFiles.length} file(s) with ${selectedMode.toUpperCase()} mode?`);
         if (!proceed) {
           console.log('\n❌ Cancelled. No files were modified.');
           return;
         }
+      } else {
+        console.log('[--yes] Skipping confirmation prompt');
       }
 
       // ═══════════════════════════════════════════════════════════════════════
@@ -1340,34 +1410,81 @@ class KokeshiBeanstalk {
 
       if (protectedFiles.length > 0) {
         console.log('');
-        console.log('┌─────────────────────────────────────────────────────────────────────┐');
-        console.log('│  ⚠️  IMPORTANT: Test decryption before deleting originals!           │');
-        console.log('├─────────────────────────────────────────────────────────────────────┤');
-        console.log('│  Run: npx kokeshi-beanstalk unprotect --file <protected-file>       │');
-        console.log('│  Verify the content, THEN delete the original plaintext files.     │');
-        console.log('└─────────────────────────────────────────────────────────────────────┘');
-        console.log('');
         console.log(`✅ Protected ${protectedFiles.length} file(s) successfully.`);
+        console.log('');
+
+        // Safety net: offer to test unprotect immediately
+        if (!skipPrompts) {
+          console.log('┌─────────────────────────────────────────────────────────────────────┐');
+          console.log('│  💡 RECOMMENDED: Test decryption before deleting originals          │');
+          console.log('└─────────────────────────────────────────────────────────────────────┘');
+          console.log('');
+
+          const testUnprotect = await wizard.confirm('Test unprotect now?');
+          if (testUnprotect) {
+            // Test unprotect on the first file
+            const testFile = protectedFiles[0];
+            console.log('');
+            console.log(`🔍 Testing unprotect on: ${path.basename(testFile)}`);
+
+            try {
+              const testContent = fs.readFileSync(testFile, 'utf8');
+              let decrypted: string;
+
+              switch (selectedMode) {
+                case 'obfuscate':
+                  decrypted = FileProtection.deobfuscate(testContent);
+                  break;
+                case 'keychain':
+                  decrypted = await FileProtection.decryptKeychain(testContent);
+                  break;
+                case 'passphrase':
+                  decrypted = FileProtection.decryptPassphrase(testContent, passphrase!);
+                  break;
+              }
+
+              // Show preview of decrypted content
+              const preview = decrypted.slice(0, 200).split('\n').slice(0, 5).join('\n');
+              console.log('');
+              console.log('📄 Decrypted preview (first 5 lines):');
+              console.log('───────────────────────────────────────────────────────────────────');
+              console.log(preview);
+              console.log('───────────────────────────────────────────────────────────────────');
+              console.log('');
+              console.log('✅ Unprotect test PASSED! Your data can be recovered.');
+              console.log('');
+              console.log('💡 You can now safely delete the original plaintext files.');
+            } catch (e: any) {
+              console.log('');
+              console.log('❌ Unprotect test FAILED!');
+              console.log(`   Error: ${e.message}`);
+              console.log('');
+              console.log('⚠️  DO NOT delete your original files until this is resolved.');
+            }
+          } else {
+            console.log('');
+            console.log('┌─────────────────────────────────────────────────────────────────────┐');
+            console.log('│  ⚠️  Before deleting originals, run:                                 │');
+            console.log('│  npx kokeshi-beanstalk unprotect --file <protected-file>            │');
+            console.log('└─────────────────────────────────────────────────────────────────────┘');
+          }
+        } else {
+          console.log('┌─────────────────────────────────────────────────────────────────────┐');
+          console.log('│  ⚠️  IMPORTANT: Test decryption before deleting originals!           │');
+          console.log('│  Run: npx kokeshi-beanstalk unprotect --file <protected-file>       │');
+          console.log('└─────────────────────────────────────────────────────────────────────┘');
+        }
       }
     } finally {
       wizard.close();
     }
   }
 
+  // STATE CHANGE: file writes (creates decrypted file from protected file)
   async unprotectFile(filePath: string, secret?: string, skipPrompts?: boolean): Promise<void> {
     const wizard = new Wizard();
 
     try {
-      // ═══════════════════════════════════════════════════════════════════════
-      // STEP 1: EXPLAIN - Show what will be decrypted
-      // ═══════════════════════════════════════════════════════════════════════
-      console.log('');
-      console.log('╔═══════════════════════════════════════════════════════════════════════╗');
-      console.log('║              KOKESHI BEANSTALK - UNPROTECT FILE                       ║');
-      console.log('║                     Step 1 of 3: Review File                          ║');
-      console.log('╚═══════════════════════════════════════════════════════════════════════╝');
-      console.log('');
-
       if (!fs.existsSync(filePath)) {
         console.error(`❌ File not found: ${filePath}`);
         process.exit(1);
@@ -1387,17 +1504,25 @@ class KokeshiBeanstalk {
       const outputPath = filePath.replace(/\.(obf|enc|aes)$/, '');
       const fileSize = (fs.statSync(filePath).size / 1024).toFixed(1);
 
-      console.log('📁 File details:');
-      console.log(`   • File: ${path.basename(filePath)}`);
-      console.log(`   • Size: ${fileSize} KB`);
-      console.log(`   • Mode: ${mode.toUpperCase()}`);
-      console.log(`   • Protected: ${new Date(parsed.header.createdAt).toLocaleString()}`);
-      console.log('');
-      console.log(`📤 Output: ${path.basename(outputPath)}`);
-      console.log('');
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 1: EXPLAIN - Always shown, even with --yes (auditable logs)
+      // ═══════════════════════════════════════════════════════════════════════
+      wizard.explain(
+        'KOKESHI BEANSTALK - UNPROTECT FILE',
+        'Step 1 of 3: Review File',
+        [
+          '📁 File details:',
+          `   • File: ${path.basename(filePath)}`,
+          `   • Size: ${fileSize} KB`,
+          `   • Mode: ${mode.toUpperCase()}`,
+          `   • Protected: ${new Date(parsed.header.createdAt).toLocaleString()}`,
+          '',
+          `📤 Output: ${path.basename(outputPath)}`
+        ]
+      );
 
       // ═══════════════════════════════════════════════════════════════════════
-      // STEP 2: CONFIRM - Get passphrase if needed, confirm action
+      // STEP 2: CONFIRM - Get passphrase if needed, confirm action (skipped with --yes)
       // ═══════════════════════════════════════════════════════════════════════
       console.log('═══════════════════════════════════════════════════════════════════════');
       console.log('                     Step 2 of 3: Confirm Decryption                    ');
@@ -1421,6 +1546,8 @@ class KokeshiBeanstalk {
           console.log('\n❌ Cancelled. No changes were made.');
           return;
         }
+      } else {
+        console.log('[--yes] Skipping confirmation prompt');
       }
 
       // ═══════════════════════════════════════════════════════════════════════
