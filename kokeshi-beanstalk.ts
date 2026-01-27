@@ -18,7 +18,13 @@ import { execSync } from 'child_process';
 const CLAWDBOT_CONFIG_PATH = path.join(os.homedir(), '.clawdbot', 'clawdbot.json');
 const CLAWD_WORKSPACE = path.join(os.homedir(), 'clawd');
 const BLOOM_STATE_PATH = path.join(os.homedir(), '.clawdbot', 'beanstalk-bloom.json');
+const KEYCHAIN_SERVICE = 'kokeshi-beanstalk';
+const KEYCHAIN_ACCOUNT = 'file-protection-key';
 const GATEWAY_PORT = 18789;
+
+// Magic header for protected files
+const MAGIC_HEADER = 'KBS1';
+const FILE_VERSION = '1';
 
 const PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97];
 
@@ -43,6 +49,22 @@ function fib(n: number): number {
   }
   return b;
 }
+
+// ---------- Protection Mode Types ----------
+type ProtectionMode = 'obfuscate' | 'keychain' | 'passphrase';
+
+interface ProtectionHeader {
+  version: string;
+  mode: ProtectionMode;
+  createdAt: string;
+}
+
+// File extension mapping
+const MODE_EXTENSIONS: Record<ProtectionMode, string> = {
+  obfuscate: '.obf',
+  keychain: '.enc',
+  passphrase: '.aes',
+};
 
 // ---------- Fibonacci Bloom Filter ----------
 class FibonacciBloomFilter {
@@ -86,7 +108,7 @@ class FibonacciBloomFilter {
   }
 
   mightContain(item: string): boolean {
-    return this.hashes(item).every(idx => 
+    return this.hashes(item).every(idx =>
       (this.bits[Math.floor(idx / 8)] & (1 << (idx % 8))) !== 0
     );
   }
@@ -109,53 +131,345 @@ class FibonacciBloomFilter {
   }
 }
 
-// ---------- Encryption Utilities ----------
-class SoulEncryption {
-  private static ALGORITHM = 'aes-256-cbc';
+// ---------- Keychain Access ----------
+class KeychainAccess {
+  private static isWindows = os.platform() === 'win32';
+  private static isMac = os.platform() === 'darwin';
+  private static isLinux = os.platform() === 'linux';
 
-  static encrypt(content: string, secret: string): string {
-    const salt = crypto.randomBytes(16);
-    // N=2^14, r=8, p=1 for stronger key derivation (~25ms)
-    const key = scryptSync(secret, salt, 32, { N: 16384, r: 8, p: 1 });
-    const iv = crypto.randomBytes(16);
-    const cipher = createCipheriv(this.ALGORITHM, key, iv);
-    let encrypted = cipher.update(content, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    return `${salt.toString('hex')}:${iv.toString('hex')}:${encrypted}`;
+  static async getKey(): Promise<string | null> {
+    try {
+      if (this.isMac) {
+        const result = execSync(
+          `security find-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}" -w 2>/dev/null`,
+          { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+        ).trim();
+        return result || null;
+      } else if (this.isWindows) {
+        const ps = `(Get-StoredCredential -Target "${KEYCHAIN_SERVICE}").Password | ConvertFrom-SecureString -AsPlainText`;
+        try {
+          return execSync(`powershell -Command "${ps}"`, { encoding: 'utf8' }).trim() || null;
+        } catch {
+          return null;
+        }
+      } else if (this.isLinux) {
+        try {
+          return execSync(
+            `secret-tool lookup service "${KEYCHAIN_SERVICE}" account "${KEYCHAIN_ACCOUNT}" 2>/dev/null`,
+            { encoding: 'utf8' }
+          ).trim() || null;
+        } catch {
+          return null;
+        }
+      }
+    } catch {
+      return null;
+    }
+    return null;
   }
 
-  static decrypt(encryptedData: string, secret: string): string {
-    const [saltHex, ivHex, encrypted] = encryptedData.split(':');
+  static async setKey(key: string): Promise<boolean> {
+    try {
+      if (this.isMac) {
+        execSync(
+          `security add-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}" -w "${key}" -U`,
+          { stdio: 'pipe' }
+        );
+        return true;
+      } else if (this.isWindows) {
+        const ps = `New-StoredCredential -Target "${KEYCHAIN_SERVICE}" -UserName "${KEYCHAIN_ACCOUNT}" -Password "${key}" -Persist LocalMachine`;
+        execSync(`powershell -Command "${ps}"`, { stdio: 'pipe' });
+        return true;
+      } else if (this.isLinux) {
+        execSync(
+          `echo -n "${key}" | secret-tool store --label="${KEYCHAIN_SERVICE}" service "${KEYCHAIN_SERVICE}" account "${KEYCHAIN_ACCOUNT}"`,
+          { stdio: 'pipe' }
+        );
+        return true;
+      }
+    } catch (e) {
+      return false;
+    }
+    return false;
+  }
+
+  static getInstructions(): string {
+    if (this.isMac) {
+      return 'macOS Keychain is available. Make sure Keychain Access is unlocked.';
+    } else if (this.isWindows) {
+      return 'Windows Credential Manager requires the CredentialManager PowerShell module.\nInstall with: Install-Module -Name CredentialManager';
+    } else if (this.isLinux) {
+      return 'Linux Secret Service requires secret-tool.\nInstall with: sudo apt install libsecret-tools (Debian/Ubuntu)\n             sudo dnf install libsecret (Fedora)';
+    }
+    return 'Keychain not supported on this platform.';
+  }
+}
+
+// ---------- File Protection System (AEAD) ----------
+class FileProtection {
+  private static ALGORITHM_GCM = 'aes-256-gcm';
+  private static AUTH_TAG_LENGTH = 16;
+
+  // Build magic header + JSON metadata
+  private static buildHeader(mode: ProtectionMode): string {
+    const header: ProtectionHeader = {
+      version: FILE_VERSION,
+      mode,
+      createdAt: new Date().toISOString(),
+    };
+    return `${MAGIC_HEADER}\n${JSON.stringify(header)}\n`;
+  }
+
+  // Parse header from protected file
+  static parseHeader(data: string): { header: ProtectionHeader; payload: string } | null {
+    const lines = data.split('\n');
+    if (lines.length < 3 || lines[0] !== MAGIC_HEADER) {
+      return null;
+    }
+    try {
+      const header: ProtectionHeader = JSON.parse(lines[1]);
+      const payload = lines.slice(2).join('\n');
+      return { header, payload };
+    } catch {
+      return null;
+    }
+  }
+
+  // Mode 1: Obfuscate (Base64 + scramble - always reversible, NOT encryption)
+  static obfuscate(content: string): string {
+    const headerStr = this.buildHeader('obfuscate');
+
+    // Base64 encode
+    const b64 = Buffer.from(content, 'utf8').toString('base64');
+
+    // Simple byte rotation (reversible)
+    const rotated = b64.split('').map((c, i) => {
+      const code = c.charCodeAt(0);
+      return String.fromCharCode(code ^ (i % 17));  // XOR with position mod prime
+    }).join('');
+
+    return headerStr + Buffer.from(rotated, 'utf8').toString('base64');
+  }
+
+  static deobfuscate(data: string): string {
+    const parsed = this.parseHeader(data);
+    if (!parsed || parsed.header.mode !== 'obfuscate') {
+      throw new Error('Not a valid obfuscated file');
+    }
+
+    const rotated = Buffer.from(parsed.payload, 'base64').toString('utf8');
+
+    // Reverse XOR rotation
+    const b64 = rotated.split('').map((c, i) => {
+      const code = c.charCodeAt(0);
+      return String.fromCharCode(code ^ (i % 17));
+    }).join('');
+
+    return Buffer.from(b64, 'base64').toString('utf8');
+  }
+
+  // Mode 2: Keychain (AES-256-GCM AEAD, key in system keychain)
+  static async encryptKeychain(content: string): Promise<string> {
+    let key = await KeychainAccess.getKey();
+
+    if (!key) {
+      key = crypto.randomBytes(32).toString('hex');
+      const stored = await KeychainAccess.setKey(key);
+      if (!stored) {
+        throw new Error('Failed to store key in system keychain.\n' + KeychainAccess.getInstructions());
+      }
+    }
+
+    const headerStr = this.buildHeader('keychain');
+
+    const salt = crypto.randomBytes(16);
+    const derivedKey = scryptSync(key, salt, 32, { N: 16384, r: 8, p: 1 });
+    const iv = crypto.randomBytes(12);  // GCM uses 12-byte IV
+    const cipher = createCipheriv(this.ALGORITHM_GCM, derivedKey, iv) as crypto.CipherGCM;
+
+    let encrypted = cipher.update(content, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+
+    // Format: salt:iv:authTag:ciphertext
+    return headerStr + `${salt.toString('hex')}:${iv.toString('hex')}:${authTag}:${encrypted}`;
+  }
+
+  static async decryptKeychain(data: string): Promise<string> {
+    const parsed = this.parseHeader(data);
+    if (!parsed || parsed.header.mode !== 'keychain') {
+      throw new Error('Not a valid keychain-encrypted file');
+    }
+
+    const key = await KeychainAccess.getKey();
+    if (!key) {
+      throw new Error('No key found in system keychain. Cannot decrypt.\n' + KeychainAccess.getInstructions());
+    }
+
+    const [saltHex, ivHex, authTagHex, encrypted] = parsed.payload.split(':');
     const salt = Buffer.from(saltHex, 'hex');
     const iv = Buffer.from(ivHex, 'hex');
-    // N=2^14, r=8, p=1 for stronger key derivation (~25ms)
-    const key = scryptSync(secret, salt, 32, { N: 16384, r: 8, p: 1 });
-    const decipher = createDecipheriv(this.ALGORITHM, key, iv);
+    const authTag = Buffer.from(authTagHex, 'hex');
+    const derivedKey = scryptSync(key, salt, 32, { N: 16384, r: 8, p: 1 });
+
+    const decipher = createDecipheriv(this.ALGORITHM_GCM, derivedKey, iv) as crypto.DecipherGCM;
+    decipher.setAuthTag(authTag);
+
     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
+
     return decrypted;
   }
 
+  // Mode 3: Passphrase (AES-256-GCM AEAD, user-managed key)
+  static encryptPassphrase(content: string, secret: string): string {
+    const headerStr = this.buildHeader('passphrase');
+
+    const salt = crypto.randomBytes(16);
+    const key = scryptSync(secret, salt, 32, { N: 16384, r: 8, p: 1 });
+    const iv = crypto.randomBytes(12);  // GCM uses 12-byte IV
+    const cipher = createCipheriv(this.ALGORITHM_GCM, key, iv) as crypto.CipherGCM;
+
+    let encrypted = cipher.update(content, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+
+    // Format: salt:iv:authTag:ciphertext
+    return headerStr + `${salt.toString('hex')}:${iv.toString('hex')}:${authTag}:${encrypted}`;
+  }
+
+  static decryptPassphrase(data: string, secret: string): string {
+    const parsed = this.parseHeader(data);
+    if (!parsed || parsed.header.mode !== 'passphrase') {
+      throw new Error('Not a valid passphrase-encrypted file');
+    }
+
+    const [saltHex, ivHex, authTagHex, encrypted] = parsed.payload.split(':');
+    const salt = Buffer.from(saltHex, 'hex');
+    const iv = Buffer.from(ivHex, 'hex');
+    const authTag = Buffer.from(authTagHex, 'hex');
+    const key = scryptSync(secret, salt, 32, { N: 16384, r: 8, p: 1 });
+
+    const decipher = createDecipheriv(this.ALGORITHM_GCM, key, iv) as crypto.DecipherGCM;
+    decipher.setAuthTag(authTag);
+
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+
+    return decrypted;
+  }
+
+  // Verify file integrity (AEAD tamper detection)
+  static async verifyIntegrity(filePath: string, secret?: string): Promise<{ valid: boolean; error?: string }> {
+    if (!fs.existsSync(filePath)) {
+      return { valid: false, error: 'File not found' };
+    }
+
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      const parsed = this.parseHeader(content);
+
+      if (!parsed) {
+        return { valid: false, error: 'Invalid file format' };
+      }
+
+      // Obfuscated files can't be tampered in a way we can detect
+      if (parsed.header.mode === 'obfuscate') {
+        try {
+          this.deobfuscate(content);
+          return { valid: true };
+        } catch {
+          return { valid: false, error: 'Deobfuscation failed' };
+        }
+      }
+
+      // For AEAD modes, try to verify the auth tag
+      if (parsed.header.mode === 'keychain') {
+        try {
+          await this.decryptKeychain(content);
+          return { valid: true };
+        } catch (e: any) {
+          if (e.message.includes('auth')) {
+            return { valid: false, error: 'TAMPERED - authentication tag verification failed' };
+          }
+          return { valid: false, error: e.message };
+        }
+      }
+
+      if (parsed.header.mode === 'passphrase') {
+        if (!secret) {
+          return { valid: true };  // Can't verify without passphrase
+        }
+        try {
+          this.decryptPassphrase(content, secret);
+          return { valid: true };
+        } catch (e: any) {
+          if (e.message.includes('auth') || e.message.includes('Unsupported state')) {
+            return { valid: false, error: 'TAMPERED - authentication tag verification failed' };
+          }
+          return { valid: false, error: 'Wrong passphrase or corrupted file' };
+        }
+      }
+
+      return { valid: true };
+    } catch (e: any) {
+      return { valid: false, error: e.message };
+    }
+  }
+
+  // Get protection status for audit display
+  static getProtectionStatus(filePath: string): { status: string; level: string; tampered?: boolean } {
+    const ext = path.extname(filePath);
+
+    if (ext === '.obf') {
+      return { status: 'OBFUSCATED', level: 'casual viewing protection (NOT encrypted)' };
+    } else if (ext === '.enc') {
+      return { status: 'KEYCHAIN', level: 'AES-256-GCM, machine-bound' };
+    } else if (ext === '.aes') {
+      return { status: 'PASSPHRASE', level: 'AES-256-GCM, user-managed key' };
+    }
+
+    // Check file permissions
+    try {
+      const stats = fs.statSync(filePath);
+      const mode = (stats.mode & 0o777).toString(8);
+      if (mode === '600') {
+        return { status: 'NONE', level: 'plaintext (protected by chmod 600)' };
+      }
+    } catch {}
+
+    return { status: 'NONE', level: 'plaintext (UNPROTECTED)' };
+  }
+}
+
+// ---------- Legacy Encryption (for backward compatibility) ----------
+class SoulEncryption {
   static encryptFile(filePath: string, secret: string): void {
+    console.warn('⚠️  DEPRECATION WARNING: "encrypt" is deprecated.');
+    console.warn('   Use "protect --mode passphrase --secret <pass>" instead.\n');
+
     if (!fs.existsSync(filePath)) {
       console.error(`File not found: ${filePath}`);
       return;
     }
     const content = fs.readFileSync(filePath, 'utf8');
-    const encrypted = this.encrypt(content, secret);
-    fs.writeFileSync(filePath + '.enc', encrypted);
-    console.log(`Encrypted: ${filePath} -> ${filePath}.enc`);
+    const encrypted = FileProtection.encryptPassphrase(content, secret);
+    fs.writeFileSync(filePath + '.aes', encrypted);
+    console.log(`Encrypted: ${filePath} -> ${filePath}.aes`);
   }
 
-  static decryptFile(encryptedPath: string, secret: string, outputPath?: string): void {
+  static decryptFile(encryptedPath: string, secret: string): void {
+    console.warn('⚠️  DEPRECATION WARNING: "decrypt" is deprecated.');
+    console.warn('   Use "unprotect --file <path>" instead.\n');
+
     if (!fs.existsSync(encryptedPath)) {
       console.error(`File not found: ${encryptedPath}`);
       return;
     }
     const encrypted = fs.readFileSync(encryptedPath, 'utf8');
     try {
-      const decrypted = this.decrypt(encrypted, secret);
-      const output = outputPath || encryptedPath.replace('.enc', '.dec');
+      const decrypted = FileProtection.decryptPassphrase(encrypted, secret);
+      const output = encryptedPath.replace('.aes', '.dec').replace('.enc', '.dec');
       fs.writeFileSync(output, decrypted);
       console.log(`Decrypted: ${encryptedPath} -> ${output}`);
     } catch (e) {
@@ -298,7 +612,6 @@ class KokeshiBeanstalk {
 
     const merged = { ...HARDENED_CONFIG, ...config };
     fs.writeFileSync(CLAWDBOT_CONFIG_PATH, JSON.stringify(merged, null, 2));
-    // Restrict config to owner-only (chmod 600)
     fs.chmodSync(CLAWDBOT_CONFIG_PATH, 0o600);
 
     const validation = this.validateConfig(merged);
@@ -319,8 +632,8 @@ class KokeshiBeanstalk {
     console.log(`Gateway token: ${merged.gateway.auth.token}`);
   }
 
-  audit(): void {
-    console.log('Running Kokeshi Beanstalk audit...');
+  async audit(): Promise<void> {
+    console.log('Running Kokeshi Beanstalk audit...\n');
 
     let config: any = {};
     if (fs.existsSync(CLAWDBOT_CONFIG_PATH)) {
@@ -339,10 +652,54 @@ class KokeshiBeanstalk {
       validation.warnings.forEach(w => console.warn(`  - ${w}`));
     }
 
+    // File Protection Status with tamper detection
+    console.log('\nFile Protection Status:');
+    const sensitiveFiles = [
+      path.join(CLAWD_WORKSPACE, 'MEMORY.md'),
+      path.join(CLAWD_WORKSPACE, 'MEMORY.md.obf'),
+      path.join(CLAWD_WORKSPACE, 'MEMORY.md.enc'),
+      path.join(CLAWD_WORKSPACE, 'MEMORY.md.aes'),
+      path.join(CLAWD_WORKSPACE, 'SOUL.md'),
+      path.join(CLAWD_WORKSPACE, 'SOUL.md.obf'),
+      path.join(CLAWD_WORKSPACE, 'SOUL.md.enc'),
+      path.join(CLAWD_WORKSPACE, 'SOUL.md.aes'),
+      CLAWDBOT_CONFIG_PATH,
+    ];
+
+    const foundFiles: string[] = [];
+    for (const file of sensitiveFiles) {
+      if (fs.existsSync(file)) {
+        foundFiles.push(file);
+      }
+    }
+
+    if (foundFiles.length === 0) {
+      console.log('  No sensitive files found');
+    } else {
+      for (let idx = 0; idx < foundFiles.length; idx++) {
+        const file = foundFiles[idx];
+        const isLast = idx === foundFiles.length - 1;
+        const prefix = isLast ? '└──' : '├──';
+        const { status, level } = FileProtection.getProtectionStatus(file);
+        const basename = path.basename(file);
+
+        // Check integrity for encrypted files
+        let integrityNote = '';
+        if (status === 'KEYCHAIN' || status === 'PASSPHRASE') {
+          const integrity = await FileProtection.verifyIntegrity(file);
+          if (!integrity.valid && integrity.error?.includes('TAMPERED')) {
+            integrityNote = ' [TAMPERED]';
+          }
+        }
+
+        console.log(`  ${prefix} ${basename.padEnd(20)} [${status}]${integrityNote} - ${level}`);
+      }
+    }
+
     this.checkExposure();
     this.logSuspiciousProbes();
     this.bloom.save();
-    console.log(`Next audit in ~${this.nextJitterMs()}ms`);
+    console.log(`\nNext audit in ~${this.nextJitterMs()}ms`);
   }
 
   monitor(): void {
@@ -350,8 +707,8 @@ class KokeshiBeanstalk {
     console.log(`  Platform: ${this.isWindows ? 'Windows' : 'Unix'}`);
     console.log(`  Jitter: ${this.jitterConfig.minMs}-${this.jitterConfig.maxMs}ms`);
 
-    const loop = () => {
-      this.audit();
+    const loop = async () => {
+      await this.audit();
       const delay = this.nextJitterMs();
       console.log(`Next check in ${delay}ms`);
       setTimeout(loop, delay);
@@ -364,9 +721,9 @@ class KokeshiBeanstalk {
       const cmd = this.isWindows
         ? `netstat -ano | findstr :${GATEWAY_PORT}`
         : `lsof -i :${GATEWAY_PORT} 2>/dev/null || netstat -an | grep ${GATEWAY_PORT}`;
-      
+
       const output = execSync(cmd, { stdio: 'pipe' }).toString();
-      
+
       if (output.includes('0.0.0.0') || output.includes('*.*') || output.includes('*:')) {
         console.warn('Gateway listening on public interface!');
       }
@@ -378,12 +735,12 @@ class KokeshiBeanstalk {
       const cmd = this.isWindows
         ? `netstat -ano | findstr :${GATEWAY_PORT} | findstr ESTABLISHED`
         : `netstat -an | grep ${GATEWAY_PORT} | grep ESTABLISHED`;
-      
+
       const connections = execSync(cmd, { stdio: 'pipe' }).toString();
-      const lines = connections.split('\n').filter(line => 
+      const lines = connections.split('\n').filter(line =>
         line.includes('ESTABLISHED') && !line.includes('127.0.0.1') && !line.includes('::1')
       );
-      
+
       if (lines.length > 0) {
         const fingerprint = crypto.createHash('sha256').update(connections + Date.now()).digest('hex').slice(0, 16);
         const probeKey = `probe:${fingerprint}`;
@@ -398,36 +755,166 @@ class KokeshiBeanstalk {
     } catch {}
   }
 
-  encryptSensitiveFiles(secret: string): void {
-    const sensitiveFiles = [
+  async protectFiles(mode: ProtectionMode, secret?: string, file?: string, force?: boolean): Promise<void> {
+    const sensitiveFiles = file ? [file] : [
       path.join(CLAWD_WORKSPACE, 'MEMORY.md'),
       path.join(CLAWD_WORKSPACE, 'SOUL.md'),
-      path.join(os.homedir(), '.clawdbot', 'clawdbot.json'),
     ];
 
-    console.log('Encrypting sensitive files...');
-    for (const file of sensitiveFiles) {
-      if (fs.existsSync(file)) {
-        SoulEncryption.encryptFile(file, secret);
-      } else {
-        console.log(`  Skipped: ${file}`);
+    console.log(`\nProtecting files with mode: ${mode.toUpperCase()}\n`);
+
+    // Mode-specific warnings
+    if (mode === 'obfuscate') {
+      console.log('┌─────────────────────────────────────────────────────────────┐');
+      console.log('│  ⚠️  OBFUSCATE ≠ ENCRYPTION                                  │');
+      console.log('│  This only stops casual viewing (shoulder surfers, etc.)    │');
+      console.log('│  Anyone with this tool can reverse it. Use --secure or      │');
+      console.log('│  --max for real encryption.                                 │');
+      console.log('└─────────────────────────────────────────────────────────────┘\n');
+    } else if (mode === 'keychain') {
+      console.log('┌─────────────────────────────────────────────────────────────┐');
+      console.log('│  📍 MACHINE-BOUND ENCRYPTION                                 │');
+      console.log('│  This file is bound to THIS COMPUTER.                       │');
+      console.log('│  It CANNOT be decrypted on another machine.                 │');
+      console.log('│  Recovery: Log into this computer with your account.        │');
+      console.log('└─────────────────────────────────────────────────────────────┘\n');
+    } else if (mode === 'passphrase') {
+      console.log('┌─────────────────────────────────────────────────────────────┐');
+      console.log('│  🔐 MAXIMUM SECURITY - READ CAREFULLY                        │');
+      console.log('├─────────────────────────────────────────────────────────────┤');
+      console.log('│  ⚠️  YOU are 100% responsible for this passphrase.           │');
+      console.log('│  ⚠️  If you lose it, your data is GONE FOREVER.              │');
+      console.log('│  ⚠️  There is NO recovery. NO backdoor. NO support.          │');
+      console.log('│  ⚠️  Not even the developer can help you.                    │');
+      console.log('├─────────────────────────────────────────────────────────────┤');
+      console.log('│  ARE YOU SURE? This is your ONLY warning.                   │');
+      console.log('│  Store your passphrase in a password manager NOW.           │');
+      console.log('└─────────────────────────────────────────────────────────────┘\n');
+
+      if (!secret) {
+        console.error('Error: --secret <passphrase> required for passphrase mode');
+        process.exit(1);
       }
     }
-    console.log('Store your secret securely!');
+
+    for (const filePath of sensitiveFiles) {
+      if (!fs.existsSync(filePath)) {
+        console.log(`  Skipped (not found): ${filePath}`);
+        continue;
+      }
+
+      const ext = MODE_EXTENSIONS[mode];
+      const outputPath = filePath + ext;
+
+      // Overwrite protection
+      if (fs.existsSync(outputPath) && !force) {
+        console.error(`  Error: ${path.basename(outputPath)} already exists.`);
+        console.error(`         Use --force to overwrite.`);
+        continue;
+      }
+
+      try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        let protected_: string;
+
+        switch (mode) {
+          case 'obfuscate':
+            protected_ = FileProtection.obfuscate(content);
+            break;
+          case 'keychain':
+            protected_ = await FileProtection.encryptKeychain(content);
+            break;
+          case 'passphrase':
+            protected_ = FileProtection.encryptPassphrase(content, secret!);
+            break;
+        }
+
+        fs.writeFileSync(outputPath, protected_);
+
+        const verb = mode === 'obfuscate' ? 'Obfuscated' : 'Encrypted';
+        console.log(`  ${verb}: ${path.basename(filePath)} -> ${path.basename(outputPath)}`);
+      } catch (e: any) {
+        console.error(`  Failed: ${filePath} - ${e.message}`);
+      }
+    }
+
+    console.log('\nDone.');
+  }
+
+  async unprotectFile(filePath: string, secret?: string): Promise<void> {
+    if (!fs.existsSync(filePath)) {
+      console.error(`File not found: ${filePath}`);
+      process.exit(1);
+    }
+
+    // Read and parse header
+    const content = fs.readFileSync(filePath, 'utf8');
+    const parsed = FileProtection.parseHeader(content);
+
+    if (!parsed) {
+      console.error('Cannot determine protection mode. File may not be protected or uses old format.');
+      process.exit(1);
+    }
+
+    const mode = parsed.header.mode;
+    console.log(`\nUnprotecting: ${filePath}`);
+    console.log(`Mode: ${mode.toUpperCase()}`);
+    console.log(`Protected on: ${parsed.header.createdAt}\n`);
+
+    try {
+      let decrypted: string;
+
+      switch (mode) {
+        case 'obfuscate':
+          decrypted = FileProtection.deobfuscate(content);
+          break;
+        case 'keychain':
+          decrypted = await FileProtection.decryptKeychain(content);
+          break;
+        case 'passphrase':
+          if (!secret) {
+            console.error('Error: --secret <passphrase> required for passphrase-protected files');
+            process.exit(1);
+          }
+          decrypted = FileProtection.decryptPassphrase(content, secret);
+          break;
+        default:
+          throw new Error('Unknown protection mode');
+      }
+
+      const outputPath = filePath.replace(/\.(obf|enc|aes)$/, '');
+      fs.writeFileSync(outputPath, decrypted);
+
+      const verb = mode === 'obfuscate' ? 'Deobfuscated' : 'Decrypted';
+      console.log(`${verb}: ${path.basename(filePath)} -> ${path.basename(outputPath)}`);
+    } catch (e: any) {
+      if (e.message.includes('auth') || e.message.includes('Unsupported state')) {
+        console.error('Failed: File may be TAMPERED or corrupted (authentication failed)');
+      } else {
+        console.error(`Failed: ${e.message}`);
+      }
+      process.exit(1);
+    }
   }
 }
 
 // ---------- CLI ----------
-function parseFlags(args: string[]): { 
-  command: string; 
+interface ParsedArgs {
+  command: string;
   jitter: Partial<JitterConfig>;
   secret?: string;
   file?: string;
-} {
+  mode?: ProtectionMode;
+  force?: boolean;
+}
+
+function parseFlags(args: string[]): ParsedArgs {
   let command = 'help';
   const jitter: Partial<JitterConfig> = {};
   let secret: string | undefined;
   let file: string | undefined;
+  let mode: ProtectionMode | undefined;
+  let force = false;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -438,69 +925,112 @@ function parseFlags(args: string[]): {
       if (arg === '--fib-multiplier' && args[i + 1]) jitter.fibMultiplier = parseInt(args[++i]);
       if (arg === '--secret' && args[i + 1]) secret = args[++i];
       if (arg === '--file' && args[i + 1]) file = args[++i];
+      if (arg === '--mode' && args[i + 1]) mode = args[++i] as ProtectionMode;
+      if (arg === '--secure') mode = 'keychain';
+      if (arg === '--max') mode = 'passphrase';
+      if (arg === '--force') force = true;
     } else if (!command || command === 'help') {
       command = arg;
     }
   }
-  return { command, jitter, secret, file };
+  return { command, jitter, secret, file, mode, force };
 }
 
 const args = process.argv.slice(2);
-const { command, jitter, secret, file } = parseFlags(args);
+const { command, jitter, secret, file, mode, force } = parseFlags(args);
 const beanstalk = new KokeshiBeanstalk(jitter);
 
-switch (command) {
-  case 'harden':
-    beanstalk.hardenConfig();
-    break;
-  case 'audit':
-    beanstalk.audit();
-    break;
-  case 'monitor':
-    beanstalk.monitor();
-    break;
-  case 'encrypt':
-    if (!secret) {
-      console.error('Usage: kokeshi-beanstalk encrypt --secret <passphrase>');
-      process.exit(1);
-    }
-    if (file) {
-      SoulEncryption.encryptFile(file, secret);
-    } else {
-      beanstalk.encryptSensitiveFiles(secret);
-    }
-    break;
-  case 'decrypt':
-    if (!secret || !file) {
-      console.error('Usage: kokeshi-beanstalk decrypt --secret <passphrase> --file <path.enc>');
-      process.exit(1);
-    }
-    SoulEncryption.decryptFile(file, secret);
-    break;
-  default:
-    console.log(`
+(async () => {
+  switch (command) {
+    case 'harden':
+      beanstalk.hardenConfig();
+      break;
+    case 'audit':
+      await beanstalk.audit();
+      break;
+    case 'monitor':
+      beanstalk.monitor();
+      break;
+
+    // Protection commands
+    case 'protect':
+      await beanstalk.protectFiles(mode || 'obfuscate', secret, file, force);
+      break;
+    case 'unprotect':
+      if (!file) {
+        console.error('Usage: kokeshi-beanstalk unprotect --file <path>');
+        process.exit(1);
+      }
+      await beanstalk.unprotectFile(file, secret);
+      break;
+
+    // Legacy commands (deprecated)
+    case 'encrypt':
+      if (!secret) {
+        console.error('Usage: kokeshi-beanstalk encrypt --secret <passphrase>');
+        process.exit(1);
+      }
+      if (file) {
+        SoulEncryption.encryptFile(file, secret);
+      } else {
+        console.warn('⚠️  DEPRECATION WARNING: "encrypt" is deprecated.');
+        console.warn('   Use "protect --mode passphrase --secret <pass>" instead.\n');
+        await beanstalk.protectFiles('passphrase', secret, undefined, force);
+      }
+      break;
+    case 'decrypt':
+      if (!secret || !file) {
+        console.error('Usage: kokeshi-beanstalk decrypt --secret <passphrase> --file <path>');
+        process.exit(1);
+      }
+      SoulEncryption.decryptFile(file, secret);
+      break;
+
+    default:
+      console.log(`
 Kokeshi Beanstalk - Runtime Guardian for Clawdbot
 A Darby Tool from PIP Projects Inc.
 
 Commands:
   harden                              Create/enforce hardened config
-  audit                               One-shot security audit
+  audit                               One-shot security audit (with tamper detection)
   monitor [options]                   Continuous monitoring
-  encrypt --secret <pass> [--file]    Encrypt sensitive files
-  decrypt --secret <pass> --file      Decrypt a file
 
-Jitter Options (monitor only):
-  --jitter-min <ms>                   Minimum delay (default: 500)
-  --jitter-max <ms>                   Maximum delay (default: 15000)
-  --prime-multiplier <n>              Prime scaling (default: 150)
-  --fib-multiplier <n>                Fibonacci variation (default: 20)
+File Protection (AES-256-GCM AEAD):
+  protect [options]                   Protect sensitive files
+    --mode obfuscate                  Light scramble (NOT encryption, always reversible)
+    --mode keychain                   AES-256-GCM, key in system keychain (machine-bound)
+    --mode passphrase --secret <p>    AES-256-GCM, user manages key (no recovery)
+    --secure                          Alias for --mode keychain
+    --max                             Alias for --mode passphrase
+    --file <path>                     Protect specific file
+    --force                           Overwrite existing protected files
+
+  unprotect --file <path>             Unprotect a file (auto-detects mode)
+    --secret <passphrase>             Required for passphrase-protected files
+
+Protection Levels:
+  ┌─────────────┬──────────┬────────────────────────────────────┐
+  │ Mode        │ Security │ Recovery                           │
+  ├─────────────┼──────────┼────────────────────────────────────┤
+  │ obfuscate   │ Low      │ Always (no key needed)             │
+  │ keychain    │ High     │ Via system login (machine-bound)   │
+  │ passphrase  │ Maximum  │ User responsible (NO recovery)     │
+  └─────────────┴──────────┴────────────────────────────────────┘
+
+File Format:
+  All protected files use magic header "KBS1" with embedded metadata.
+  Encrypted modes use AES-256-GCM for authenticated encryption (tamper detection).
 
 Examples:
   npx kokeshi-beanstalk harden
-  npx kokeshi-beanstalk monitor
-  npx kokeshi-beanstalk encrypt --secret "my-passphrase"
+  npx kokeshi-beanstalk protect                      # obfuscate (default)
+  npx kokeshi-beanstalk protect --secure             # keychain (machine-bound)
+  npx kokeshi-beanstalk protect --max --secret "x"   # passphrase (no recovery!)
+  npx kokeshi-beanstalk unprotect --file MEMORY.md.enc
 
 MIT License - PIP Projects Inc.
 github.com/darbybailey/kokeshi-beanstalk
-    `);
-}
+      `);
+  }
+})();

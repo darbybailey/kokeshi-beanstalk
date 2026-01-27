@@ -94,13 +94,38 @@ Scans your `~/.clawdbot/clawdbot.json` and fixes insecure defaults.
 npx kokeshi-beanstalk harden
 ```
 
-### Encrypt Data
+### 🔐 File Protection Levels
 
-Encrypts your `MEMORY.md` and `SOUL.md` so they aren't readable if your machine is stolen.
+Kokeshi Beanstalk offers three levels of file protection:
+
+| Mode | Security | Recovery | Best For |
+|------|----------|----------|----------|
+| `obfuscate` | Low | Always (no key needed) | Casual privacy, stops shoulder surfers |
+| `keychain` | High | Via system login | Most users - secure but can't lose key |
+| `passphrase` | Maximum | User responsible | High security needs, compliance |
 
 ```bash
-npx kokeshi-beanstalk encrypt --secret "my-super-secret-password"
+# Quick protect (obfuscate - always recoverable)
+npx kokeshi-beanstalk protect
+
+# Secure protect (keychain - recoverable via system login)
+npx kokeshi-beanstalk protect --secure
+
+# Maximum protect (passphrase - YOU manage the key)
+npx kokeshi-beanstalk protect --max --secret "your-long-passphrase"
+
+# Unprotect (auto-detects mode)
+npx kokeshi-beanstalk unprotect --file MEMORY.md.obf
+npx kokeshi-beanstalk unprotect --file MEMORY.md.enc
+npx kokeshi-beanstalk unprotect --file MEMORY.md.aes --secret "your-passphrase"
 ```
+
+**File extensions by mode:**
+- `.obf` = obfuscated (reversible, no key)
+- `.enc` = keychain encrypted (key in system keychain)
+- `.aes` = passphrase encrypted (user manages key)
+
+**Recommendation:** Use `--secure` (keychain) for most cases. Only use `--max` if you have specific compliance requirements and a password manager.
 
 ### Monitor
 
