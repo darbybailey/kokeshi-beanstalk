@@ -7,6 +7,8 @@ A Darby Tool from [PIP Projects Inc.](https://pipprojects.com)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-win%20%7C%20mac%20%7C%20linux-lightgrey)
 
+> **"Kokeshi Beanstalk never changes system state without explaining what will happen, asking permission, and confirming success."**
+
 ## The Problem
 
 Clawdbot is amazing, but the default configuration often exposes your API keys and chat history to the public internet.
@@ -126,17 +128,40 @@ Don't want to fix manually? Run: npx kokeshi-beanstalk harden
 ───────────────────────────────────────────────────────────────────────
 ```
 
-### Harden Configuration (Auto-Fix)
+### Harden Configuration (Guided Wizard)
 
-Don't want to fix issues manually? This command auto-fixes everything.
+Interactive 3-step wizard that explains changes, asks permission, then applies them.
 
 ```bash
 npx kokeshi-beanstalk harden
 ```
 
-### 🔐 File Protection Levels
+**The wizard flow:**
+1. **Step 1 (Explain)** - Shows exactly what will change
+2. **Step 2 (Confirm)** - Asks "Ready to apply these changes?"
+3. **Step 3 (Execute)** - Applies changes, shows token, confirms you saved it
 
-Kokeshi Beanstalk offers three levels of file protection:
+**For automation (CI/CD, scripts):**
+```bash
+npx kokeshi-beanstalk harden --yes    # Skip all prompts
+```
+
+### 🔐 File Protection (Guided Wizard)
+
+Interactive 3-step wizard that walks you through protecting your sensitive files.
+
+```bash
+npx kokeshi-beanstalk protect           # Interactive mode selection
+npx kokeshi-beanstalk protect --secure  # Keychain mode (machine-bound)
+npx kokeshi-beanstalk protect --max     # Passphrase mode (prompts for password)
+```
+
+**The wizard flow:**
+1. **Step 1 (Explain)** - Shows files found, explains protection levels
+2. **Step 2 (Confirm)** - You pick mode; passphrase requires double-entry + "I UNDERSTAND"
+3. **Step 3 (Execute)** - Protects files, reminds you to test decrypt before deleting originals
+
+**Protection Levels:**
 
 | Mode | Security | Recovery | Best For |
 |------|----------|----------|----------|
@@ -144,20 +169,11 @@ Kokeshi Beanstalk offers three levels of file protection:
 | `keychain` | High | Via system login | Most users - secure but can't lose key |
 | `passphrase` | Maximum | User responsible | High security needs, compliance |
 
+**For automation:**
 ```bash
-# Quick protect (obfuscate - always recoverable)
-npx kokeshi-beanstalk protect
-
-# Secure protect (keychain - recoverable via system login)
-npx kokeshi-beanstalk protect --secure
-
-# Maximum protect (passphrase - YOU manage the key)
-npx kokeshi-beanstalk protect --max --secret "your-long-passphrase"
-
-# Unprotect (auto-detects mode)
-npx kokeshi-beanstalk unprotect --file MEMORY.md.obf
-npx kokeshi-beanstalk unprotect --file MEMORY.md.enc
-npx kokeshi-beanstalk unprotect --file MEMORY.md.aes --secret "your-passphrase"
+npx kokeshi-beanstalk protect --secure --yes                    # Keychain, no prompts
+npx kokeshi-beanstalk protect --max --secret "pass" --yes       # Passphrase, no prompts
+npx kokeshi-beanstalk unprotect --file MEMORY.md.aes --secret "pass" --yes
 ```
 
 **File extensions by mode:**

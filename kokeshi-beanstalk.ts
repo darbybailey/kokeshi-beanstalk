@@ -13,6 +13,114 @@ import path from 'path';
 import os from 'os';
 import crypto, { scryptSync, createCipheriv, createDecipheriv } from 'crypto';
 import { execSync } from 'child_process';
+import readline from 'readline';
+
+// ---------- Wizard (Interactive UX) ----------
+// "Kokeshi Beanstalk never changes system state without explaining
+// what will happen, asking permission, and confirming success."
+
+class Wizard {
+  private rl: readline.Interface | null = null;
+
+  private getRL(): readline.Interface {
+    if (!this.rl) {
+      this.rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+      });
+    }
+    return this.rl;
+  }
+
+  async confirm(question: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      this.getRL().question(`${question} (yes/no): `, (answer) => {
+        resolve(answer.toLowerCase() === 'yes' || answer.toLowerCase() === 'y');
+      });
+    });
+  }
+
+  async askSecret(question: string): Promise<string> {
+    return new Promise((resolve) => {
+      const rl = this.getRL();
+
+      // Disable echo for password input
+      if (process.stdin.isTTY) {
+        process.stdout.write(`${question}: `);
+        const stdin = process.stdin;
+        const wasRaw = stdin.isRaw;
+        stdin.setRawMode(true);
+
+        let password = '';
+        const onData = (char: Buffer) => {
+          const c = char.toString();
+          if (c === '\n' || c === '\r') {
+            stdin.setRawMode(wasRaw || false);
+            stdin.removeListener('data', onData);
+            process.stdout.write('\n');
+            resolve(password);
+          } else if (c === '\u0003') { // Ctrl+C
+            process.exit(0);
+          } else if (c === '\u007F' || c === '\b') { // Backspace
+            if (password.length > 0) {
+              password = password.slice(0, -1);
+              process.stdout.write('\b \b');
+            }
+          } else {
+            password += c;
+            process.stdout.write('*');
+          }
+        };
+        stdin.on('data', onData);
+      } else {
+        // Non-TTY fallback (piped input)
+        rl.question(`${question}: `, resolve);
+      }
+    });
+  }
+
+  async selectMode(): Promise<'obfuscate' | 'keychain' | 'passphrase'> {
+    console.log('');
+    console.log('┌─────────────────────────────────────────────────────────────────────┐');
+    console.log('│  Choose Protection Level:                                           │');
+    console.log('├─────────────────────────────────────────────────────────────────────┤');
+    console.log('│  1. Obfuscate  - Light scramble, always recoverable (no key)        │');
+    console.log('│  2. Keychain   - AES-256 encryption, key in system keychain         │');
+    console.log('│  3. Passphrase - AES-256 encryption, YOU manage the key (no rescue) │');
+    console.log('└─────────────────────────────────────────────────────────────────────┘');
+    console.log('');
+
+    return new Promise((resolve) => {
+      const ask = () => {
+        this.getRL().question('Enter choice (1/2/3): ', (answer) => {
+          if (answer === '1') resolve('obfuscate');
+          else if (answer === '2') resolve('keychain');
+          else if (answer === '3') resolve('passphrase');
+          else {
+            console.log('Please enter 1, 2, or 3');
+            ask();
+          }
+        });
+      };
+      ask();
+    });
+  }
+
+  async requireConfirmation(text: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      this.getRL().question(`Type "${text}" to confirm: `, (answer) => {
+        resolve(answer === text);
+      });
+    });
+  }
+
+  close(): void {
+    if (this.rl) {
+      this.rl.close();
+      this.rl = null;
+    }
+  }
+}
 
 // ---------- Constants ----------
 const CLAWDBOT_CONFIG_PATH = path.join(os.homedir(), '.clawdbot', 'clawdbot.json');
@@ -597,39 +705,140 @@ class KokeshiBeanstalk {
     return result;
   }
 
-  hardenConfig(): void {
-    if (!fs.existsSync(path.dirname(CLAWDBOT_CONFIG_PATH))) {
-      fs.mkdirSync(path.dirname(CLAWDBOT_CONFIG_PATH), { recursive: true });
+  async hardenConfig(skipPrompts: boolean = false): Promise<void> {
+    const wizard = new Wizard();
+
+    try {
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 1: EXPLAIN - Show what will change
+      // ═══════════════════════════════════════════════════════════════════════
+      console.log('');
+      console.log('╔═══════════════════════════════════════════════════════════════════════╗');
+      console.log('║              KOKESHI BEANSTALK - HARDEN CONFIG                        ║');
+      console.log('║                     Step 1 of 3: Review Changes                       ║');
+      console.log('╚═══════════════════════════════════════════════════════════════════════╝');
+      console.log('');
+
+      const configExists = fs.existsSync(CLAWDBOT_CONFIG_PATH);
+      let currentConfig: any = {};
+
+      if (configExists) {
+        currentConfig = JSON.parse(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'));
+        console.log('📄 Existing config found. The following changes will be applied:');
+      } else {
+        console.log('📄 No config found. A new secure config will be created:');
+      }
+
+      console.log('');
+      console.log('┌─────────────────────────────────────────────────────────────────────┐');
+
+      // Show what will change
+      const changes: string[] = [];
+
+      if (currentConfig.gateway?.bind !== '127.0.0.1') {
+        changes.push('  • Bind gateway to 127.0.0.1 (localhost only)');
+      }
+      if (currentConfig.gateway?.auth?.mode !== 'token') {
+        changes.push('  • Enable token authentication');
+      }
+      if (!currentConfig.gateway?.auth?.token) {
+        changes.push('  • Generate new 256-bit auth token');
+      }
+      if (currentConfig.gateway?.tailscale?.mode !== 'off') {
+        changes.push('  • Disable Tailscale exposure');
+      }
+      if (currentConfig.channels?.dmPolicy !== 'pairing') {
+        changes.push('  • Set DM policy to "pairing"');
+      }
+      if (currentConfig.agents?.defaults?.sandbox?.mode !== 'all') {
+        changes.push('  • Enable sandbox mode for all agents');
+      }
+      changes.push('  • Set file permissions to 600 (owner-only)');
+
+      if (changes.length === 1) {
+        console.log('│  ✅ Config is already secure. Only permission check needed.         │');
+      } else {
+        changes.forEach(c => console.log('│' + c.padEnd(72) + '│'));
+      }
+
+      console.log('└─────────────────────────────────────────────────────────────────────┘');
+      console.log('');
+      console.log(`📁 Config path: ${CLAWDBOT_CONFIG_PATH}`);
+      console.log('');
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 2: CONFIRM - Ask permission
+      // ═══════════════════════════════════════════════════════════════════════
+      if (!skipPrompts) {
+        console.log('═══════════════════════════════════════════════════════════════════════');
+        console.log('                     Step 2 of 3: Confirm Changes                      ');
+        console.log('═══════════════════════════════════════════════════════════════════════');
+        console.log('');
+
+        const confirmed = await wizard.confirm('Ready to apply these changes?');
+        if (!confirmed) {
+          console.log('\n❌ Cancelled. No changes were made.');
+          return;
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 3: EXECUTE - Apply changes and confirm success
+      // ═══════════════════════════════════════════════════════════════════════
+      console.log('');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('                     Step 3 of 3: Applying Changes                      ');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('');
+
+      if (!fs.existsSync(path.dirname(CLAWDBOT_CONFIG_PATH))) {
+        fs.mkdirSync(path.dirname(CLAWDBOT_CONFIG_PATH), { recursive: true });
+      }
+
+      const merged = { ...HARDENED_CONFIG, ...currentConfig };
+
+      // Ensure critical security settings
+      merged.gateway = merged.gateway || {};
+      merged.gateway.bind = '127.0.0.1';
+      merged.gateway.auth = merged.gateway.auth || {};
+      merged.gateway.auth.mode = 'token';
+      if (!merged.gateway.auth.token) {
+        merged.gateway.auth.token = crypto.randomBytes(32).toString('hex');
+      }
+      merged.gateway.tailscale = { mode: 'off' };
+      merged.channels = merged.channels || {};
+      merged.channels.dmPolicy = 'pairing';
+      merged.agents = merged.agents || {};
+      merged.agents.defaults = merged.agents.defaults || {};
+      merged.agents.defaults.sandbox = { mode: 'all' };
+
+      fs.writeFileSync(CLAWDBOT_CONFIG_PATH, JSON.stringify(merged, null, 2));
+      fs.chmodSync(CLAWDBOT_CONFIG_PATH, 0o600);
+
+      console.log('✅ Config saved to ' + CLAWDBOT_CONFIG_PATH);
+      console.log('✅ Permissions set to 600 (owner-only)');
+      console.log('');
+      console.log('┌─────────────────────────────────────────────────────────────────────┐');
+      console.log('│  🔑 YOUR GATEWAY AUTH TOKEN (save this somewhere safe!)             │');
+      console.log('├─────────────────────────────────────────────────────────────────────┤');
+      console.log(`│  ${merged.gateway.auth.token}  │`);
+      console.log('└─────────────────────────────────────────────────────────────────────┘');
+      console.log('');
+
+      if (!skipPrompts) {
+        const saved = await wizard.confirm('Have you saved the token above?');
+        if (saved) {
+          console.log('\n✅ Hardening complete! Your Clawdbot is now secured.');
+        } else {
+          console.log('\n⚠️  Please save the token before closing this window!');
+          console.log('   You can also find it in: ' + CLAWDBOT_CONFIG_PATH);
+        }
+      } else {
+        console.log('✅ Hardening complete (automated mode).');
+      }
+    } finally {
+      wizard.close();
     }
-
-    let config: any = {};
-    let existing = false;
-    if (fs.existsSync(CLAWDBOT_CONFIG_PATH)) {
-      config = JSON.parse(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'));
-      existing = true;
-      console.log('Existing config found - merging');
-    }
-
-    const merged = { ...HARDENED_CONFIG, ...config };
-    fs.writeFileSync(CLAWDBOT_CONFIG_PATH, JSON.stringify(merged, null, 2));
-    fs.chmodSync(CLAWDBOT_CONFIG_PATH, 0o600);
-
-    const validation = this.validateConfig(merged);
-    console.log(`Config ${existing ? 'updated' : 'created'} at ${CLAWDBOT_CONFIG_PATH}`);
-
-    if (!validation.valid) {
-      console.error('Critical issues:');
-      validation.errors.forEach(e => console.error(`  - ${e}`));
-    } else {
-      console.log('Config passes validation');
-    }
-
-    if (validation.warnings.length > 0) {
-      console.warn('Recommendations:');
-      validation.warnings.forEach(w => console.warn(`  - ${w}`));
-    }
-
-    console.log(`Gateway token: ${merged.gateway.auth.token}`);
   }
 
   // Security scan - reports issues without fixing them (read-only)
@@ -973,145 +1182,298 @@ class KokeshiBeanstalk {
     } catch {}
   }
 
-  async protectFiles(mode: ProtectionMode, secret?: string, file?: string, force?: boolean): Promise<void> {
-    const sensitiveFiles = file ? [file] : [
-      path.join(CLAWD_WORKSPACE, 'MEMORY.md'),
-      path.join(CLAWD_WORKSPACE, 'SOUL.md'),
-    ];
+  async protectFiles(mode: ProtectionMode | undefined, secret?: string, file?: string, force?: boolean, skipPrompts?: boolean): Promise<void> {
+    const wizard = new Wizard();
 
-    console.log(`\nProtecting files with mode: ${mode.toUpperCase()}\n`);
+    try {
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 1: EXPLAIN - Show what will be protected
+      // ═══════════════════════════════════════════════════════════════════════
+      console.log('');
+      console.log('╔═══════════════════════════════════════════════════════════════════════╗');
+      console.log('║              KOKESHI BEANSTALK - PROTECT FILES                        ║');
+      console.log('║                     Step 1 of 3: Review Files                         ║');
+      console.log('╚═══════════════════════════════════════════════════════════════════════╝');
+      console.log('');
 
-    // Mode-specific warnings
-    if (mode === 'obfuscate') {
-      console.log('┌─────────────────────────────────────────────────────────────┐');
-      console.log('│  ⚠️  OBFUSCATE ≠ ENCRYPTION                                  │');
-      console.log('│  This only stops casual viewing (shoulder surfers, etc.)    │');
-      console.log('│  Anyone with this tool can reverse it. Use --secure or      │');
-      console.log('│  --max for real encryption.                                 │');
-      console.log('└─────────────────────────────────────────────────────────────┘\n');
-    } else if (mode === 'keychain') {
-      console.log('┌─────────────────────────────────────────────────────────────┐');
-      console.log('│  📍 MACHINE-BOUND ENCRYPTION                                 │');
-      console.log('│  This file is bound to THIS COMPUTER.                       │');
-      console.log('│  It CANNOT be decrypted on another machine.                 │');
-      console.log('│  Recovery: Log into this computer with your account.        │');
-      console.log('└─────────────────────────────────────────────────────────────┘\n');
-    } else if (mode === 'passphrase') {
-      console.log('┌─────────────────────────────────────────────────────────────┐');
-      console.log('│  🔐 MAXIMUM SECURITY - READ CAREFULLY                        │');
-      console.log('├─────────────────────────────────────────────────────────────┤');
-      console.log('│  ⚠️  YOU are 100% responsible for this passphrase.           │');
-      console.log('│  ⚠️  If you lose it, your data is GONE FOREVER.              │');
-      console.log('│  ⚠️  There is NO recovery. NO backdoor. NO support.          │');
-      console.log('│  ⚠️  Not even the developer can help you.                    │');
-      console.log('├─────────────────────────────────────────────────────────────┤');
-      console.log('│  ARE YOU SURE? This is your ONLY warning.                   │');
-      console.log('│  Store your passphrase in a password manager NOW.           │');
-      console.log('└─────────────────────────────────────────────────────────────┘\n');
+      const sensitiveFiles = file ? [file] : [
+        path.join(CLAWD_WORKSPACE, 'MEMORY.md'),
+        path.join(CLAWD_WORKSPACE, 'SOUL.md'),
+      ];
 
-      if (!secret) {
-        console.error('Error: --secret <passphrase> required for passphrase mode');
+      // Find files that actually exist
+      const existingFiles = sensitiveFiles.filter(f => fs.existsSync(f));
+
+      if (existingFiles.length === 0) {
+        console.log('❌ No files found to protect.');
+        if (!file) {
+          console.log(`   Looked in: ${CLAWD_WORKSPACE}`);
+        }
+        return;
+      }
+
+      console.log('📁 Files to protect:');
+      existingFiles.forEach(f => {
+        const size = fs.statSync(f).size;
+        console.log(`   • ${path.basename(f)} (${(size / 1024).toFixed(1)} KB)`);
+      });
+      console.log('');
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 2: CONFIRM - Choose mode and confirm
+      // ═══════════════════════════════════════════════════════════════════════
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('                     Step 2 of 3: Choose Protection                     ');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+
+      let selectedMode: ProtectionMode = mode || 'obfuscate';
+      let passphrase = secret;
+
+      if (!skipPrompts && !mode) {
+        selectedMode = await wizard.selectMode();
+      }
+
+      // Mode-specific handling
+      if (selectedMode === 'obfuscate') {
+        console.log('');
+        console.log('┌─────────────────────────────────────────────────────────────────────┐');
+        console.log('│  ⚠️  OBFUSCATE ≠ ENCRYPTION                                          │');
+        console.log('│  This only stops casual viewing. Anyone with this tool can reverse. │');
+        console.log('└─────────────────────────────────────────────────────────────────────┘');
+        console.log('');
+      } else if (selectedMode === 'keychain') {
+        console.log('');
+        console.log('┌─────────────────────────────────────────────────────────────────────┐');
+        console.log('│  📍 MACHINE-BOUND ENCRYPTION                                         │');
+        console.log('│  Files can ONLY be decrypted on THIS computer with YOUR account.    │');
+        console.log('│  Moving .enc files to another machine = data loss.                  │');
+        console.log('└─────────────────────────────────────────────────────────────────────┘');
+        console.log('');
+      } else if (selectedMode === 'passphrase') {
+        console.log('');
+        console.log('┌─────────────────────────────────────────────────────────────────────┐');
+        console.log('│  🔐 MAXIMUM SECURITY - NO RECOVERY POSSIBLE                          │');
+        console.log('├─────────────────────────────────────────────────────────────────────┤');
+        console.log('│  • YOU are 100% responsible for this passphrase                     │');
+        console.log('│  • If you lose it, your data is GONE FOREVER                        │');
+        console.log('│  • There is NO backdoor, NO support, NO recovery                    │');
+        console.log('│  • Not even the developer can help you                              │');
+        console.log('└─────────────────────────────────────────────────────────────────────┘');
+        console.log('');
+
+        if (!skipPrompts) {
+          if (!passphrase) {
+            passphrase = await wizard.askSecret('Enter passphrase');
+            const confirm = await wizard.askSecret('Confirm passphrase');
+
+            if (passphrase !== confirm) {
+              console.log('\n❌ Passphrases do not match. Aborting.');
+              return;
+            }
+          }
+
+          const understood = await wizard.requireConfirmation('I UNDERSTAND');
+          if (!understood) {
+            console.log('\n❌ Cancelled. You must type "I UNDERSTAND" to proceed.');
+            return;
+          }
+        } else if (!passphrase) {
+          console.error('Error: --secret <passphrase> required for passphrase mode');
+          process.exit(1);
+        }
+      }
+
+      if (!skipPrompts) {
+        const proceed = await wizard.confirm(`Protect ${existingFiles.length} file(s) with ${selectedMode.toUpperCase()} mode?`);
+        if (!proceed) {
+          console.log('\n❌ Cancelled. No files were modified.');
+          return;
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 3: EXECUTE - Protect files and confirm
+      // ═══════════════════════════════════════════════════════════════════════
+      console.log('');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('                     Step 3 of 3: Protecting Files                      ');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('');
+
+      const protectedFiles: string[] = [];
+
+      for (const filePath of existingFiles) {
+        const ext = MODE_EXTENSIONS[selectedMode];
+        const outputPath = filePath + ext;
+
+        // Overwrite protection
+        if (fs.existsSync(outputPath) && !force) {
+          console.log(`⚠️  Skipped: ${path.basename(outputPath)} already exists (use --force)`);
+          continue;
+        }
+
+        try {
+          const content = fs.readFileSync(filePath, 'utf8');
+          let protected_: string;
+
+          switch (selectedMode) {
+            case 'obfuscate':
+              protected_ = FileProtection.obfuscate(content);
+              break;
+            case 'keychain':
+              protected_ = await FileProtection.encryptKeychain(content);
+              break;
+            case 'passphrase':
+              protected_ = FileProtection.encryptPassphrase(content, passphrase!);
+              break;
+          }
+
+          fs.writeFileSync(outputPath, protected_);
+          protectedFiles.push(outputPath);
+
+          const verb = selectedMode === 'obfuscate' ? 'Obfuscated' : 'Encrypted';
+          console.log(`✅ ${verb}: ${path.basename(filePath)} → ${path.basename(outputPath)}`);
+        } catch (e: any) {
+          console.error(`❌ Failed: ${filePath} - ${e.message}`);
+        }
+      }
+
+      if (protectedFiles.length > 0) {
+        console.log('');
+        console.log('┌─────────────────────────────────────────────────────────────────────┐');
+        console.log('│  ⚠️  IMPORTANT: Test decryption before deleting originals!           │');
+        console.log('├─────────────────────────────────────────────────────────────────────┤');
+        console.log('│  Run: npx kokeshi-beanstalk unprotect --file <protected-file>       │');
+        console.log('│  Verify the content, THEN delete the original plaintext files.     │');
+        console.log('└─────────────────────────────────────────────────────────────────────┘');
+        console.log('');
+        console.log(`✅ Protected ${protectedFiles.length} file(s) successfully.`);
+      }
+    } finally {
+      wizard.close();
+    }
+  }
+
+  async unprotectFile(filePath: string, secret?: string, skipPrompts?: boolean): Promise<void> {
+    const wizard = new Wizard();
+
+    try {
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 1: EXPLAIN - Show what will be decrypted
+      // ═══════════════════════════════════════════════════════════════════════
+      console.log('');
+      console.log('╔═══════════════════════════════════════════════════════════════════════╗');
+      console.log('║              KOKESHI BEANSTALK - UNPROTECT FILE                       ║');
+      console.log('║                     Step 1 of 3: Review File                          ║');
+      console.log('╚═══════════════════════════════════════════════════════════════════════╝');
+      console.log('');
+
+      if (!fs.existsSync(filePath)) {
+        console.error(`❌ File not found: ${filePath}`);
         process.exit(1);
       }
-    }
 
-    for (const filePath of sensitiveFiles) {
-      if (!fs.existsSync(filePath)) {
-        console.log(`  Skipped (not found): ${filePath}`);
-        continue;
+      // Read and parse header
+      const content = fs.readFileSync(filePath, 'utf8');
+      const parsed = FileProtection.parseHeader(content);
+
+      if (!parsed) {
+        console.error('❌ Cannot determine protection mode.');
+        console.error('   File may not be protected or uses an old format.');
+        process.exit(1);
       }
 
-      const ext = MODE_EXTENSIONS[mode];
-      const outputPath = filePath + ext;
+      const mode = parsed.header.mode;
+      const outputPath = filePath.replace(/\.(obf|enc|aes)$/, '');
+      const fileSize = (fs.statSync(filePath).size / 1024).toFixed(1);
 
-      // Overwrite protection
-      if (fs.existsSync(outputPath) && !force) {
-        console.error(`  Error: ${path.basename(outputPath)} already exists.`);
-        console.error(`         Use --force to overwrite.`);
-        continue;
+      console.log('📁 File details:');
+      console.log(`   • File: ${path.basename(filePath)}`);
+      console.log(`   • Size: ${fileSize} KB`);
+      console.log(`   • Mode: ${mode.toUpperCase()}`);
+      console.log(`   • Protected: ${new Date(parsed.header.createdAt).toLocaleString()}`);
+      console.log('');
+      console.log(`📤 Output: ${path.basename(outputPath)}`);
+      console.log('');
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 2: CONFIRM - Get passphrase if needed, confirm action
+      // ═══════════════════════════════════════════════════════════════════════
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('                     Step 2 of 3: Confirm Decryption                    ');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('');
+
+      let passphrase = secret;
+
+      if (mode === 'passphrase') {
+        if (!passphrase && !skipPrompts) {
+          passphrase = await wizard.askSecret('Enter passphrase');
+        } else if (!passphrase) {
+          console.error('Error: --secret <passphrase> required for passphrase-protected files');
+          process.exit(1);
+        }
       }
+
+      if (!skipPrompts) {
+        const proceed = await wizard.confirm('Proceed with decryption?');
+        if (!proceed) {
+          console.log('\n❌ Cancelled. No changes were made.');
+          return;
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 3: EXECUTE - Decrypt and confirm
+      // ═══════════════════════════════════════════════════════════════════════
+      console.log('');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('                     Step 3 of 3: Decrypting File                       ');
+      console.log('═══════════════════════════════════════════════════════════════════════');
+      console.log('');
 
       try {
-        const content = fs.readFileSync(filePath, 'utf8');
-        let protected_: string;
+        let decrypted: string;
 
         switch (mode) {
           case 'obfuscate':
-            protected_ = FileProtection.obfuscate(content);
+            decrypted = FileProtection.deobfuscate(content);
             break;
           case 'keychain':
-            protected_ = await FileProtection.encryptKeychain(content);
+            decrypted = await FileProtection.decryptKeychain(content);
             break;
           case 'passphrase':
-            protected_ = FileProtection.encryptPassphrase(content, secret!);
+            decrypted = FileProtection.decryptPassphrase(content, passphrase!);
             break;
+          default:
+            throw new Error('Unknown protection mode');
         }
 
-        fs.writeFileSync(outputPath, protected_);
+        fs.writeFileSync(outputPath, decrypted);
 
-        const verb = mode === 'obfuscate' ? 'Obfuscated' : 'Encrypted';
-        console.log(`  ${verb}: ${path.basename(filePath)} -> ${path.basename(outputPath)}`);
+        const verb = mode === 'obfuscate' ? 'Deobfuscated' : 'Decrypted';
+        console.log(`✅ ${verb}: ${path.basename(filePath)} → ${path.basename(outputPath)}`);
+        console.log('');
+        console.log('┌─────────────────────────────────────────────────────────────────────┐');
+        console.log('│  ✅ SUCCESS! File has been restored.                                │');
+        console.log('│  You can now safely delete the protected file if desired.          │');
+        console.log('└─────────────────────────────────────────────────────────────────────┘');
       } catch (e: any) {
-        console.error(`  Failed: ${filePath} - ${e.message}`);
+        console.log('');
+        if (e.message.includes('auth') || e.message.includes('Unsupported state')) {
+          console.error('❌ DECRYPTION FAILED: Authentication error');
+          console.error('');
+          console.error('   Possible causes:');
+          console.error('   • Wrong passphrase');
+          console.error('   • File has been tampered with');
+          console.error('   • File is corrupted');
+        } else {
+          console.error(`❌ DECRYPTION FAILED: ${e.message}`);
+        }
+        process.exit(1);
       }
-    }
-
-    console.log('\nDone.');
-  }
-
-  async unprotectFile(filePath: string, secret?: string): Promise<void> {
-    if (!fs.existsSync(filePath)) {
-      console.error(`File not found: ${filePath}`);
-      process.exit(1);
-    }
-
-    // Read and parse header
-    const content = fs.readFileSync(filePath, 'utf8');
-    const parsed = FileProtection.parseHeader(content);
-
-    if (!parsed) {
-      console.error('Cannot determine protection mode. File may not be protected or uses old format.');
-      process.exit(1);
-    }
-
-    const mode = parsed.header.mode;
-    console.log(`\nUnprotecting: ${filePath}`);
-    console.log(`Mode: ${mode.toUpperCase()}`);
-    console.log(`Protected on: ${parsed.header.createdAt}\n`);
-
-    try {
-      let decrypted: string;
-
-      switch (mode) {
-        case 'obfuscate':
-          decrypted = FileProtection.deobfuscate(content);
-          break;
-        case 'keychain':
-          decrypted = await FileProtection.decryptKeychain(content);
-          break;
-        case 'passphrase':
-          if (!secret) {
-            console.error('Error: --secret <passphrase> required for passphrase-protected files');
-            process.exit(1);
-          }
-          decrypted = FileProtection.decryptPassphrase(content, secret);
-          break;
-        default:
-          throw new Error('Unknown protection mode');
-      }
-
-      const outputPath = filePath.replace(/\.(obf|enc|aes)$/, '');
-      fs.writeFileSync(outputPath, decrypted);
-
-      const verb = mode === 'obfuscate' ? 'Deobfuscated' : 'Decrypted';
-      console.log(`${verb}: ${path.basename(filePath)} -> ${path.basename(outputPath)}`);
-    } catch (e: any) {
-      if (e.message.includes('auth') || e.message.includes('Unsupported state')) {
-        console.error('Failed: File may be TAMPERED or corrupted (authentication failed)');
-      } else {
-        console.error(`Failed: ${e.message}`);
-      }
-      process.exit(1);
+    } finally {
+      wizard.close();
     }
   }
 }
@@ -1124,6 +1486,7 @@ interface ParsedArgs {
   file?: string;
   mode?: ProtectionMode;
   force?: boolean;
+  yes?: boolean;  // Skip all prompts (for automation)
 }
 
 function parseFlags(args: string[]): ParsedArgs {
@@ -1133,6 +1496,7 @@ function parseFlags(args: string[]): ParsedArgs {
   let file: string | undefined;
   let mode: ProtectionMode | undefined;
   let force = false;
+  let yes = false;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -1147,15 +1511,16 @@ function parseFlags(args: string[]): ParsedArgs {
       if (arg === '--secure') mode = 'keychain';
       if (arg === '--max') mode = 'passphrase';
       if (arg === '--force') force = true;
+      if (arg === '--yes' || arg === '-y') yes = true;
     } else if (!command || command === 'help') {
       command = arg;
     }
   }
-  return { command, jitter, secret, file, mode, force };
+  return { command, jitter, secret, file, mode, force, yes };
 }
 
 const args = process.argv.slice(2);
-const { command, jitter, secret, file, mode, force } = parseFlags(args);
+const { command, jitter, secret, file, mode, force, yes } = parseFlags(args);
 const beanstalk = new KokeshiBeanstalk(jitter);
 
 (async () => {
@@ -1164,7 +1529,7 @@ const beanstalk = new KokeshiBeanstalk(jitter);
       await beanstalk.scan();
       break;
     case 'harden':
-      beanstalk.hardenConfig();
+      await beanstalk.hardenConfig(yes);
       break;
     case 'audit':
       await beanstalk.audit();
@@ -1175,14 +1540,14 @@ const beanstalk = new KokeshiBeanstalk(jitter);
 
     // Protection commands
     case 'protect':
-      await beanstalk.protectFiles(mode || 'obfuscate', secret, file, force);
+      await beanstalk.protectFiles(mode, secret, file, force, yes);
       break;
     case 'unprotect':
       if (!file) {
         console.error('Usage: kokeshi-beanstalk unprotect --file <path>');
         process.exit(1);
       }
-      await beanstalk.unprotectFile(file, secret);
+      await beanstalk.unprotectFile(file, secret, yes);
       break;
 
     // Legacy commands (deprecated)
@@ -1196,7 +1561,7 @@ const beanstalk = new KokeshiBeanstalk(jitter);
       } else {
         console.warn('⚠️  DEPRECATION WARNING: "encrypt" is deprecated.');
         console.warn('   Use "protect --mode passphrase --secret <pass>" instead.\n');
-        await beanstalk.protectFiles('passphrase', secret, undefined, force);
+        await beanstalk.protectFiles('passphrase', secret, undefined, force, yes);
       }
       break;
     case 'decrypt':
@@ -1212,14 +1577,17 @@ const beanstalk = new KokeshiBeanstalk(jitter);
 Kokeshi Beanstalk - Runtime Guardian for Clawdbot
 A Darby Tool from PIP Projects Inc.
 
+"Kokeshi Beanstalk never changes system state without explaining
+what will happen, asking permission, and confirming success."
+
 Commands:
   scan                                Security scan (read-only, shows how to fix)
-  harden                              Auto-fix all security issues
+  harden                              Guided security hardening (3-step wizard)
   audit                               One-shot audit (with tamper detection)
   monitor [options]                   Continuous monitoring
 
 File Protection (AES-256-GCM AEAD):
-  protect [options]                   Protect sensitive files
+  protect [options]                   Guided file protection (3-step wizard)
     --mode obfuscate                  Light scramble (NOT encryption, always reversible)
     --mode keychain                   AES-256-GCM, key in system keychain (machine-bound)
     --mode passphrase --secret <p>    AES-256-GCM, user manages key (no recovery)
@@ -1228,8 +1596,12 @@ File Protection (AES-256-GCM AEAD):
     --file <path>                     Protect specific file
     --force                           Overwrite existing protected files
 
-  unprotect --file <path>             Unprotect a file (auto-detects mode)
+  unprotect --file <path>             Guided file decryption (3-step wizard)
     --secret <passphrase>             Required for passphrase-protected files
+
+Automation:
+  --yes, -y                           Skip all prompts (for scripts)
+                                      Example: npx kokeshi-beanstalk harden --yes
 
 Protection Levels:
   ┌─────────────┬──────────┬────────────────────────────────────┐
@@ -1240,16 +1612,12 @@ Protection Levels:
   │ passphrase  │ Maximum  │ User responsible (NO recovery)     │
   └─────────────┴──────────┴────────────────────────────────────┘
 
-File Format:
-  All protected files use magic header "KBS1" with embedded metadata.
-  Encrypted modes use AES-256-GCM for authenticated encryption (tamper detection).
-
 Examples:
   npx kokeshi-beanstalk scan                         # check for issues (no changes)
-  npx kokeshi-beanstalk harden                       # auto-fix all issues
-  npx kokeshi-beanstalk protect                      # obfuscate (default)
-  npx kokeshi-beanstalk protect --secure             # keychain (machine-bound)
-  npx kokeshi-beanstalk protect --max --secret "x"   # passphrase (no recovery!)
+  npx kokeshi-beanstalk harden                       # guided security setup
+  npx kokeshi-beanstalk harden --yes                 # auto-fix (no prompts)
+  npx kokeshi-beanstalk protect                      # guided file protection
+  npx kokeshi-beanstalk protect --secure --yes       # keychain mode (no prompts)
   npx kokeshi-beanstalk unprotect --file MEMORY.md.enc
 
 MIT License - PIP Projects Inc.
