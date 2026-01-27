@@ -1,0 +1,110 @@
+{
+  "timestamp": "2026-01-27T02:32:47.582Z",
+  "totalTests": 12,
+  "passed": 12,
+  "blocked": 12,
+  "attackVectorsBlocked": 5,
+  "attackVectorsSucceeded": 0,
+  "jitterUnpredictabilityScore": 80,
+  "configValidationCoverage": 100,
+  "cryptoStrengthScore": 100,
+  "overallSecurityScore": 96,
+  "tests": [
+    {
+      "name": "Unauthenticated Port Connection",
+      "category": "Network",
+      "passed": true,
+      "blocked": true,
+      "details": "Port not listening (localhost-only or not running)",
+      "severity": "info"
+    },
+    {
+      "name": "External Network Connection",
+      "category": "Network",
+      "passed": true,
+      "blocked": true,
+      "details": "Correctly bound to localhost only",
+      "severity": "info"
+    },
+    {
+      "name": "Config File Access Control",
+      "category": "FileSystem",
+      "passed": true,
+      "blocked": true,
+      "details": "Config protected (mode: 600) | Token present in config",
+      "severity": "info"
+    },
+    {
+      "name": "Memory File Protection",
+      "category": "FileSystem",
+      "passed": true,
+      "blocked": true,
+      "details": "MEMORY.md not found (safe or not created)",
+      "severity": "info"
+    },
+    {
+      "name": "Path Traversal Protection",
+      "category": "FileSystem",
+      "passed": true,
+      "blocked": true,
+      "details": "File paths are hardcoded, no user input accepted for paths",
+      "severity": "info"
+    },
+    {
+      "name": "Jitter Timing Predictability",
+      "category": "Timing",
+      "passed": true,
+      "blocked": true,
+      "details": "Score: 80/100 | Unique values: 649/1000 | CV: 49.7% | Pattern: None | AutoCorr: 0.748",
+      "severity": "low"
+    },
+    {
+      "name": "Window Prediction Attack",
+      "category": "Timing",
+      "passed": true,
+      "blocked": true,
+      "details": "Prediction success: 32/100 (32.0%)",
+      "severity": "low"
+    },
+    {
+      "name": "Bloom Filter Collision Resistance",
+      "category": "Crypto",
+      "passed": true,
+      "blocked": true,
+      "details": "Collisions: 0/10000 (0.000%)",
+      "severity": "info"
+    },
+    {
+      "name": "Key Derivation Cost",
+      "category": "Crypto",
+      "passed": true,
+      "blocked": true,
+      "details": "Avg derivation time: 29.8ms per password",
+      "severity": "info"
+    },
+    {
+      "name": "Auth Token Entropy",
+      "category": "Crypto",
+      "passed": true,
+      "blocked": true,
+      "details": "Token entropy: 256 bits (64 hex chars)",
+      "severity": "info"
+    },
+    {
+      "name": "IV Randomness (No Reuse)",
+      "category": "Crypto",
+      "passed": true,
+      "blocked": true,
+      "details": "IVs reused: 0/1000",
+      "severity": "info"
+    },
+    {
+      "name": "Config Validation Coverage",
+      "category": "Validation",
+      "passed": true,
+      "blocked": true,
+      "details": "Critical: 3/3 | Recommended: 3/3 | Total: 100%",
+      "severity": "info"
+    }
+  ]
+}

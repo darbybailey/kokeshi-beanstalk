@@ -4,6 +4,9 @@
 // A Darby Tool from PIP Projects Inc.
 // Prime-Fibonacci jitter timing + Bloom filter + Config validation
 // MIT License - PIP Projects Inc.
+//
+// Developed by Darby Bailey McDonough, Ph.D.
+// With AI pair programming assistance
 
 import fs from 'fs';
 import path from 'path';
@@ -24,6 +27,12 @@ const _phi = (1 + Math.sqrt(5)) / 2;
 const _A = (_phi * _phi) / (_phi * _phi + 1);  // amplitude normalization factor
 const _W = 4;  // weave offset
 const _S = 3;  // stride
+
+// Temporal drift factor
+function _Ad(): number {
+  const _t = Math.floor(Date.now() / 86400000) % 17;  // daily cycle, prime modulus
+  return _A * (1 + _t * 0.001);  // micro-drift
+}
 
 // Fibonacci generator
 function fib(n: number): number {
@@ -241,7 +250,7 @@ class KokeshiBeanstalk {
     const _e = process.hrtime()[1] % 100;  // nanosecond noise
 
     let interval = primeBase * this.jitterConfig.primeMultiplier + fibVariation * this.jitterConfig.fibMultiplier + entropy + _e;
-    interval = Math.floor(interval * (1 + (_A * (this._d > 0 ? 1 : -1) * 0.1)));
+    interval = Math.floor(interval * (1 + (_Ad() * (this._d > 0 ? 1 : -1) * 0.1)));
     interval = Math.max(interval, this.jitterConfig.minMs);
     interval = Math.min(interval, this.jitterConfig.maxMs);
     return interval;

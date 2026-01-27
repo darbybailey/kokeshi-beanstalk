@@ -93,8 +93,12 @@ npm install -g kokeshi-beanstalk
 
 ## Author
 
-**Darby Bailey McDonough, Ph.D.**  
+**Darby Bailey McDonough, Ph.D.**
 [GitHub: @darbybailey](https://github.com/darbybailey)
+
+## Acknowledgments
+
+Built with assistance from Claude (Anthropic), Gemini (Google), and Grok (xAI).
 
 ## License
 
