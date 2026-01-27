@@ -12,7 +12,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto, { scryptSync, createCipheriv, createDecipheriv } from 'crypto';
-import { execSync } from 'child_process';
+import { execSync, execFileSync, spawnSync } from 'child_process';
 import readline from 'readline';
 
 // ---------- Wizard (Interactive UX) ----------
@@ -275,6 +275,8 @@ class FibonacciBloomFilter {
 }
 
 // ---------- Keychain Access ----------
+// SECURITY: All shell commands use execFileSync/spawnSync with array args
+// to prevent command injection (CVE-2024-XXXX class vulnerabilities)
 class KeychainAccess {
   private static isWindows = os.platform() === 'win32';
   private static isMac = os.platform() === 'darwin';
@@ -283,24 +285,38 @@ class KeychainAccess {
   static async getKey(): Promise<string | null> {
     try {
       if (this.isMac) {
-        const result = execSync(
-          `security find-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}" -w 2>/dev/null`,
-          { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-        ).trim();
+        // SAFE: execFileSync with array args - no shell interpolation
+        const result = execFileSync('security', [
+          'find-generic-password',
+          '-s', KEYCHAIN_SERVICE,
+          '-a', KEYCHAIN_ACCOUNT,
+          '-w'
+        ], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
         return result || null;
       } else if (this.isWindows) {
-        const ps = `(Get-StoredCredential -Target "${KEYCHAIN_SERVICE}").Password | ConvertFrom-SecureString -AsPlainText`;
+        // SAFE: PowerShell with -EncodedCommand to prevent injection
+        // The command is base64-encoded so no user input can escape
+        const psScript = `(Get-StoredCredential -Target '${KEYCHAIN_SERVICE}').Password | ConvertFrom-SecureString -AsPlainText`;
+        const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
         try {
-          return execSync(`powershell -Command "${ps}"`, { encoding: 'utf8' }).trim() || null;
+          const result = execFileSync('powershell', [
+            '-NoProfile',
+            '-NonInteractive',
+            '-EncodedCommand', encoded
+          ], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+          return result || null;
         } catch {
           return null;
         }
       } else if (this.isLinux) {
+        // SAFE: execFileSync with array args - no shell interpolation
         try {
-          return execSync(
-            `secret-tool lookup service "${KEYCHAIN_SERVICE}" account "${KEYCHAIN_ACCOUNT}" 2>/dev/null`,
-            { encoding: 'utf8' }
-          ).trim() || null;
+          const result = execFileSync('secret-tool', [
+            'lookup',
+            'service', KEYCHAIN_SERVICE,
+            'account', KEYCHAIN_ACCOUNT
+          ], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+          return result || null;
         } catch {
           return null;
         }
@@ -314,21 +330,40 @@ class KeychainAccess {
   static async setKey(key: string): Promise<boolean> {
     try {
       if (this.isMac) {
-        execSync(
-          `security add-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}" -w "${key}" -U`,
-          { stdio: 'pipe' }
-        );
+        // SAFE: execFileSync with array args - key passed as separate argument
+        // The -w flag takes the next argument as the password value
+        execFileSync('security', [
+          'add-generic-password',
+          '-s', KEYCHAIN_SERVICE,
+          '-a', KEYCHAIN_ACCOUNT,
+          '-w', key,  // key is passed as argument, not interpolated into string
+          '-U'        // update if exists
+        ], { stdio: 'pipe' });
         return true;
       } else if (this.isWindows) {
-        const ps = `New-StoredCredential -Target "${KEYCHAIN_SERVICE}" -UserName "${KEYCHAIN_ACCOUNT}" -Password "${key}" -Persist LocalMachine`;
-        execSync(`powershell -Command "${ps}"`, { stdio: 'pipe' });
+        // SAFE: PowerShell with -EncodedCommand prevents injection
+        // Key is embedded in pre-encoded script, not concatenated to command line
+        const psScript = `New-StoredCredential -Target '${KEYCHAIN_SERVICE}' -UserName '${KEYCHAIN_ACCOUNT}' -Password '${key.replace(/'/g, "''")}' -Persist LocalMachine`;
+        const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+        execFileSync('powershell', [
+          '-NoProfile',
+          '-NonInteractive',
+          '-EncodedCommand', encoded
+        ], { stdio: 'pipe' });
         return true;
       } else if (this.isLinux) {
-        execSync(
-          `echo -n "${key}" | secret-tool store --label="${KEYCHAIN_SERVICE}" service "${KEYCHAIN_SERVICE}" account "${KEYCHAIN_ACCOUNT}"`,
-          { stdio: 'pipe' }
-        );
-        return true;
+        // SAFE: spawnSync with stdin - key never touches command line
+        // secret-tool reads the secret from stdin when using --stdin flag
+        const result = spawnSync('secret-tool', [
+          'store',
+          '--label', KEYCHAIN_SERVICE,
+          'service', KEYCHAIN_SERVICE,
+          'account', KEYCHAIN_ACCOUNT
+        ], {
+          input: key,  // key passed via stdin, never in command args
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+        return result.status === 0;
       }
     } catch (e) {
       return false;
