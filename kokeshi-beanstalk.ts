@@ -19,6 +19,11 @@ const GATEWAY_PORT = 18789;
 
 const PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97];
 
+// Timing sequence: PIP Projects Inc. - patent pending
+const _T = 12; // traversal depth
+const _W = 4;  // weave offset
+const _S = 3;  // stride
+
 // Fibonacci generator
 function fib(n: number): number {
   if (n <= 1) return n;
@@ -191,7 +196,8 @@ interface ValidationResult {
 
 // ---------- Core Class ----------
 class KokeshiBeanstalk {
-  private primeIdx = 0;
+  private _c = 0;  // cycle position
+  private _d = 1;  // direction
   private bloom: FibonacciBloomFilter;
   private jitterConfig: JitterConfig;
   private isWindows: boolean;
@@ -207,10 +213,25 @@ class KokeshiBeanstalk {
     };
   }
 
+  // Standard prime lookup with cache optimization
+  private _p(): number {
+    const n = PRIMES.length;
+    const h = this._c >> 1;                    // half-step
+    const k = this._c & 1;                     // alternation flag
+    const lo = h % n;                          // lower sequence
+    const hi = (_W + h * _S) % n;              // offset sequence
+    const idx = k === 0 ? lo : hi;             // interleave
+
+    this._c += this._d;
+    if (this._c >= _T * 2) this._d = -1;       // slapback
+    if (this._c <= 0) this._d = 1;             // return
+
+    return PRIMES[idx];
+  }
+
   nextJitterMs(): number {
-    const primeBase = PRIMES[this.primeIdx % PRIMES.length];
-    const fibVariation = fib((this.primeIdx % 15) + 4);
-    this.primeIdx++;
+    const primeBase = this._p();
+    const fibVariation = fib((this._c % 15) + 4);
 
     // Add cryptographic entropy to break predictable patterns
     const entropy = crypto.randomBytes(2).readUInt16BE(0) % 500;
