@@ -86,9 +86,49 @@ The actual trigger time is non-deterministic. Even with full knowledge of the so
 
 ## Usage
 
-### Harden Configuration
+### 🔍 Security Scan
 
-Scans your `~/.clawdbot/clawdbot.json` and fixes insecure defaults.
+Check your installation for security issues without making changes. Shows a security score and tells you exactly how to fix each issue.
+
+```bash
+npx kokeshi-beanstalk scan
+```
+
+**Example output:**
+```
+╔═══════════════════════════════════════════════════════════════════════╗
+║              KOKESHI BEANSTALK - SECURITY SCAN                        ║
+╠═══════════════════════════════════════════════════════════════════════╣
+║  ❌ Security Score: 35/100  Grade: F                                  ║
+║  [███████░░░░░░░░░░░░░]                                               ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+🔴 [CRITICAL] Your bot is visible to the entire internet
+   Technical: Gateway bound to 0.0.0.0 instead of 127.0.0.1
+   Fix: Edit ~/.clawdbot/clawdbot.json: set "gateway.bind": "127.0.0.1"
+
+🟠 [HIGH] Your memories are stored in plain text
+   Technical: MEMORY.md exists unencrypted
+   Fix: npx kokeshi-beanstalk protect --secure --file ~/clawd/MEMORY.md
+
+🟡 [MEDIUM] Your bot accepts messages from anyone
+   Technical: DM policy is "open" instead of "pairing"
+   Fix: Edit config: set "channels.dmPolicy": "pairing"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔴 CRITICAL = You could be hacked right now
+🟠 HIGH     = Fix this today
+🟡 MEDIUM   = Recommended improvement
+🔵 LOW      = Nice to have
+
+───────────────────────────────────────────────────────────────────────
+Don't want to fix manually? Run: npx kokeshi-beanstalk harden
+───────────────────────────────────────────────────────────────────────
+```
+
+### Harden Configuration (Auto-Fix)
+
+Don't want to fix issues manually? This command auto-fixes everything.
 
 ```bash
 npx kokeshi-beanstalk harden

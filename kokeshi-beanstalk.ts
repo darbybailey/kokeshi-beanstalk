@@ -632,6 +632,224 @@ class KokeshiBeanstalk {
     console.log(`Gateway token: ${merged.gateway.auth.token}`);
   }
 
+  // Security scan - reports issues without fixing them (read-only)
+  async scan(): Promise<void> {
+    interface Finding {
+      severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+      plain: string;      // User-friendly description
+      technical: string;  // Technical details
+      fix: string;        // How to fix it
+      points: number;     // Points deducted from score
+    }
+
+    const findings: Finding[] = [];
+    let config: any = {};
+
+    // Check 1: Config file exists
+    if (!fs.existsSync(CLAWDBOT_CONFIG_PATH)) {
+      findings.push({
+        severity: 'CRITICAL',
+        plain: 'Your bot has no security configuration',
+        technical: 'No clawdbot.json config file found',
+        fix: 'npx kokeshi-beanstalk harden',
+        points: 25
+      });
+    } else {
+      config = JSON.parse(fs.readFileSync(CLAWDBOT_CONFIG_PATH, 'utf8'));
+
+      // Check 2: Config file permissions
+      const stats = fs.statSync(CLAWDBOT_CONFIG_PATH);
+      const mode = (stats.mode & 0o777).toString(8);
+      if (mode !== '600') {
+        findings.push({
+          severity: 'HIGH',
+          plain: 'Other users on this computer can read your config',
+          technical: `Config file has mode ${mode}, should be 600`,
+          fix: `chmod 600 "${CLAWDBOT_CONFIG_PATH}"`,
+          points: 15
+        });
+      }
+
+      // Check 3: Gateway binding
+      if (config.gateway?.bind && config.gateway.bind !== '127.0.0.1') {
+        findings.push({
+          severity: 'CRITICAL',
+          plain: 'Your bot is visible to the entire internet',
+          technical: `Gateway bound to ${config.gateway.bind} instead of 127.0.0.1`,
+          fix: `Edit ${CLAWDBOT_CONFIG_PATH}: set "gateway.bind": "127.0.0.1"`,
+          points: 30
+        });
+      }
+
+      // Check 4: Auth mode
+      if (config.gateway?.auth?.mode !== 'token') {
+        findings.push({
+          severity: 'CRITICAL',
+          plain: 'Anyone can control your bot without a password',
+          technical: `Auth mode is "${config.gateway?.auth?.mode || 'none'}" - no token required`,
+          fix: 'npx kokeshi-beanstalk harden',
+          points: 30
+        });
+      }
+
+      // Check 5: Auth token present
+      if (!config.gateway?.auth?.token && !process.env.CLAWDBOT_AUTH_TOKEN) {
+        findings.push({
+          severity: 'CRITICAL',
+          plain: 'Your bot has no access password set',
+          technical: 'No gateway auth token configured',
+          fix: 'npx kokeshi-beanstalk harden',
+          points: 25
+        });
+      }
+
+      // Check 6: DM Policy
+      if (config.channels?.dmPolicy !== 'pairing') {
+        findings.push({
+          severity: 'MEDIUM',
+          plain: 'Your bot accepts messages from anyone',
+          technical: `DM policy is "${config.channels?.dmPolicy || 'open'}" instead of "pairing"`,
+          fix: `Edit ${CLAWDBOT_CONFIG_PATH}: set "channels.dmPolicy": "pairing"`,
+          points: 10
+        });
+      }
+
+      // Check 7: Sandbox mode
+      if (config.agents?.defaults?.sandbox?.mode !== 'all') {
+        findings.push({
+          severity: 'MEDIUM',
+          plain: 'Skills can run any code without sandboxing',
+          technical: `Sandbox mode is "${config.agents?.defaults?.sandbox?.mode || 'none'}" instead of "all"`,
+          fix: `Edit ${CLAWDBOT_CONFIG_PATH}: set "agents.defaults.sandbox.mode": "all"`,
+          points: 10
+        });
+      }
+
+      // Check 8: Tailscale exposure
+      if (config.gateway?.tailscale?.mode && config.gateway.tailscale.mode !== 'off') {
+        findings.push({
+          severity: 'HIGH',
+          plain: 'Your bot is exposed on your Tailscale network',
+          technical: `Tailscale mode is "${config.gateway.tailscale.mode}" - network exposed`,
+          fix: `Edit ${CLAWDBOT_CONFIG_PATH}: set "gateway.tailscale.mode": "off"`,
+          points: 15
+        });
+      }
+    }
+
+    // Check 9: Sensitive files unprotected
+    const sensitiveFiles = [
+      { path: path.join(CLAWD_WORKSPACE, 'MEMORY.md'), name: 'MEMORY.md', desc: 'memories' },
+      { path: path.join(CLAWD_WORKSPACE, 'SOUL.md'), name: 'SOUL.md', desc: 'personality' },
+    ];
+
+    for (const { path: filePath, name, desc } of sensitiveFiles) {
+      if (fs.existsSync(filePath)) {
+        const hasObf = fs.existsSync(filePath + '.obf');
+        const hasEnc = fs.existsSync(filePath + '.enc');
+        const hasAes = fs.existsSync(filePath + '.aes');
+
+        if (!hasObf && !hasEnc && !hasAes) {
+          findings.push({
+            severity: 'HIGH',
+            plain: `Your ${desc} are stored in plain text`,
+            technical: `${name} exists unencrypted`,
+            fix: `npx kokeshi-beanstalk protect --secure --file "${filePath}"`,
+            points: 15
+          });
+        }
+      }
+    }
+
+    // Check 10: Port exposure (runtime check)
+    try {
+      const cmd = this.isWindows
+        ? `netstat -ano | findstr :${GATEWAY_PORT}`
+        : `lsof -i :${GATEWAY_PORT} 2>/dev/null || netstat -an | grep ${GATEWAY_PORT}`;
+
+      const output = execSync(cmd, { stdio: 'pipe' }).toString();
+
+      if (output.includes('0.0.0.0') || output.includes('*.*') || output.includes('*:')) {
+        findings.push({
+          severity: 'CRITICAL',
+          plain: 'Your bot is actively listening on ALL network interfaces',
+          technical: `Port ${GATEWAY_PORT} bound to 0.0.0.0 (publicly accessible right now!)`,
+          fix: 'Fix config and restart Clawdbot',
+          points: 30
+        });
+      }
+    } catch {}
+
+    // Calculate score
+    const totalDeductions = findings.reduce((sum, f) => sum + f.points, 0);
+    const score = Math.max(0, 100 - totalDeductions);
+    const grade = score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F';
+
+    // Print header with score
+    console.log('');
+    console.log('╔═══════════════════════════════════════════════════════════════════════╗');
+    console.log('║              KOKESHI BEANSTALK - SECURITY SCAN                        ║');
+    console.log('╠═══════════════════════════════════════════════════════════════════════╣');
+
+    const scoreBar = '█'.repeat(Math.floor(score / 5)) + '░'.repeat(20 - Math.floor(score / 5));
+    const scoreColor = score >= 80 ? '✅' : score >= 60 ? '⚠️' : '❌';
+    console.log(`║  ${scoreColor} Security Score: ${score}/100  Grade: ${grade}                              ║`.slice(0, 76) + '║');
+    console.log(`║  [${scoreBar}]                                       ║`.slice(0, 76) + '║');
+    console.log('╚═══════════════════════════════════════════════════════════════════════╝');
+    console.log('');
+
+    if (findings.length === 0) {
+      console.log('✅ No security issues found. Your installation is properly secured.');
+      console.log('');
+    } else {
+      // Group by severity
+      const criticals = findings.filter(f => f.severity === 'CRITICAL');
+      const highs = findings.filter(f => f.severity === 'HIGH');
+      const mediums = findings.filter(f => f.severity === 'MEDIUM');
+      const lows = findings.filter(f => f.severity === 'LOW');
+
+      const printFinding = (f: Finding, icon: string) => {
+        console.log(`${icon} [${f.severity}] ${f.plain}`);
+        console.log(`   Technical: ${f.technical}`);
+        console.log(`   Fix: ${f.fix}`);
+        console.log('');
+      };
+
+      if (criticals.length > 0) {
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        criticals.forEach(f => printFinding(f, '🔴'));
+      }
+
+      if (highs.length > 0) {
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        highs.forEach(f => printFinding(f, '🟠'));
+      }
+
+      if (mediums.length > 0) {
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        mediums.forEach(f => printFinding(f, '🟡'));
+      }
+
+      if (lows.length > 0) {
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        lows.forEach(f => printFinding(f, '🔵'));
+      }
+
+      // Severity legend
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.log('🔴 CRITICAL = You could be hacked right now');
+      console.log('🟠 HIGH     = Fix this today');
+      console.log('🟡 MEDIUM   = Recommended improvement');
+      console.log('🔵 LOW      = Nice to have');
+      console.log('');
+
+      // Auto-fix suggestion
+      console.log('───────────────────────────────────────────────────────────────────────');
+      console.log("Don't want to fix manually? Run: npx kokeshi-beanstalk harden");
+      console.log('───────────────────────────────────────────────────────────────────────');
+    }
+  }
+
   async audit(): Promise<void> {
     console.log('Running Kokeshi Beanstalk audit...\n');
 
@@ -942,6 +1160,9 @@ const beanstalk = new KokeshiBeanstalk(jitter);
 
 (async () => {
   switch (command) {
+    case 'scan':
+      await beanstalk.scan();
+      break;
     case 'harden':
       beanstalk.hardenConfig();
       break;
@@ -992,8 +1213,9 @@ Kokeshi Beanstalk - Runtime Guardian for Clawdbot
 A Darby Tool from PIP Projects Inc.
 
 Commands:
-  harden                              Create/enforce hardened config
-  audit                               One-shot security audit (with tamper detection)
+  scan                                Security scan (read-only, shows how to fix)
+  harden                              Auto-fix all security issues
+  audit                               One-shot audit (with tamper detection)
   monitor [options]                   Continuous monitoring
 
 File Protection (AES-256-GCM AEAD):
@@ -1023,7 +1245,8 @@ File Format:
   Encrypted modes use AES-256-GCM for authenticated encryption (tamper detection).
 
 Examples:
-  npx kokeshi-beanstalk harden
+  npx kokeshi-beanstalk scan                         # check for issues (no changes)
+  npx kokeshi-beanstalk harden                       # auto-fix all issues
   npx kokeshi-beanstalk protect                      # obfuscate (default)
   npx kokeshi-beanstalk protect --secure             # keychain (machine-bound)
   npx kokeshi-beanstalk protect --max --secret "x"   # passphrase (no recovery!)
