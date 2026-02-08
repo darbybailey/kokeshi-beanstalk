@@ -43,48 +43,42 @@ Most security monitors check at fixed intervals (e.g., every 10s). Attackers can
 Kokeshi Beanstalk uses a hybrid timing algorithm:
 
 ```
-Interval = (Prime × Multiplier) + (Fibonacci × Variation)
+Interval = (Prime × Multiplier) + (Fibonacci × Variation) + CSPRNG noise
 ```
 
-This creates a non-harmonic, unpredictable monitoring pattern that is mathematically difficult to evade.
+This creates a non-harmonic monitoring pattern with genuine cryptographic randomness added at each cycle. The jitter is **scheduling noise** — it makes monitoring intervals unpredictable, but it is not a security primitive on its own. Your primary defenses are localhost binding, auth tokens, and proper firewalling. Jitter is an additional layer that makes probe timing harder to predict.
 
 ### 🌸 Fibonacci Bloom Filter
 
 Tracks suspicious connection attempts using a space-efficient probabilistic data structure. It remembers repeat probes without needing a heavy database.
 
-## 🧠 Security Model: Entropy vs. Pattern
+## 🧠 Timing Model: Anti-Pattern Scheduling
 
-Kokeshi Beanstalk uses a two-layer timing defense based on **Kerckhoffs's Principle**: the algorithm is public, but the entropy is private.
+Kokeshi Beanstalk uses a two-layer timing approach to make monitoring intervals unpredictable.
+
+> **Important:** Jitter is a scheduling technique, not a security boundary. Your real security comes from localhost binding, auth tokens, file encryption, and OS-level firewalling. Jitter makes it harder for an attacker to time probes between checks, but it does not compensate for weak network binding, missing auth, or absent firewalling.
 
 ### Layer 1: The Weave (Coverage)
-The Prime-Fibonacci slapback algorithm ensures monitoring intervals are distributed non-linearly across the time spectrum. This prevents **harmonic resonance** — the predictable gaps that occur with fixed-interval monitoring (e.g., checking every 10 seconds allows attackers to safely probe at second 11).
+The Prime-Fibonacci slapback algorithm distributes monitoring intervals non-linearly across the time spectrum. This avoids the predictable gaps that occur with fixed-interval monitoring (e.g., checking every 10 seconds creates a known safe window at second 11).
 
-* **Prime numbers** provide gap-free coverage.
+* **Prime numbers** distribute check windows across the time spectrum.
 * **Fibonacci variation** adds amplitude diversity.
 * **Figure-8 slapback** prevents linear sequence prediction.
-* **φ (phi)** amplitude minimizes harmonic patterns.
 
 ### Layer 2: The Noise (Unpredictability)
-The actual trigger time is non-deterministic. Even with full knowledge of the source code and current cycle state, an attacker cannot predict the next check due to multiple runtime entropy sources:
+Each interval includes genuine cryptographic randomness:
 
-| Source | Entropy | Notes |
+| Source | Range | Notes |
 | :--- | :--- | :--- |
-| `crypto.randomBytes(2)` | 0–500ms | CSPRNG-derived true random |
-| `process.hrtime()[1]` | 0–100ns | CPU nanosecond jitter |
-| **Temporal Drift** | ×17 daily variants | Based on server clock state |
+| `crypto.randomBytes(2)` | 0–500ms | CSPRNG — the real entropy source |
+| `process.hrtime()[1]` | 0–100ns | CPU nanosecond noise |
+| **Temporal Drift** | ×17 daily variants | Minor daily variation |
 
-**Combined entropy space:** ~42 million possible intervals per base value.
+The CSPRNG component provides the meaningful unpredictability. The prime-fibonacci weave determines the general scheduling window; the random noise determines the exact moment within that window.
 
 ### What This Means
 
-| With Source Code, Attacker Knows | Attacker Still Cannot Know |
-| :--- | :--- |
-| The prime weave pattern | Your CSPRNG state |
-| The phi-derived amplitude | Your CPU's nanosecond counter |
-| The slapback depth (144) | Your exact server clock |
-| The formula structure | **The next interval** |
-
-> **Result:** The algorithm determines the *window* of the check. Entropy determines the *exact moment*. This makes timing attacks computationally infeasible — not because the math is secret, but because the randomness is real.
+The weave pattern is deterministic and public (visible in source code). The CSPRNG noise is private and genuinely random. An attacker who reads this source code knows the scheduling pattern but cannot predict the exact check time due to the random component. This makes timing attacks harder but is **not a substitute for proper network security**.
 
 ## Usage
 
@@ -229,6 +223,45 @@ npm install -g kokeshi-beanstalk
 | Public Exposure | ✅ SOLVED |
 | RCE via Skills | ✅ MITIGATED |
 | Plaintext Memory | ✅ SOLVED |
+
+## Keychain Threat Model
+
+Keychain mode (`--secure`) stores the encryption key in your OS keychain (macOS Keychain, Windows Credential Manager, or Linux Secret Service).
+
+**What keychain protects against:**
+- Disk theft (encrypted at rest by OS)
+- Casual file access by another user on the same machine
+- Key extraction without your OS login credentials
+
+**What keychain does NOT protect against:**
+- A compromised OS user session (malware running as your user, an attacker logged into your account)
+- Root/admin-level access to the machine
+- Physical access to an unlocked, logged-in session
+
+**Recommended OS hardening:**
+- Enable full-disk encryption (FileVault, BitLocker, LUKS)
+- Use a screen lock with short timeout
+- Practice least-privilege (don't run as admin daily)
+- Keep your OS and keychain software updated
+
+If your threat model includes a compromised OS session, use `--max` (passphrase mode) with a strong passphrase stored in a separate password manager.
+
+## Security Guarantees and Non-Guarantees
+
+**What Kokeshi Beanstalk guarantees:**
+- Config hardening enforces localhost binding, token auth, and restrictive file permissions
+- AES-256-GCM (AEAD) encryption provides confidentiality and tamper detection for protected files
+- Symlink, hardlink, and path traversal attacks are blocked on all file write paths
+- The `--secret` CLI flag is blocked by default (requires `--force`) to prevent process-list leakage
+- Obfuscate mode is clearly labeled as NOT encryption throughout the UI
+- All state-changing commands follow Explain -> Confirm -> Execute flow
+
+**What Kokeshi Beanstalk does NOT guarantee:**
+- Jitter timing is scheduling noise, not a security boundary — it does not replace firewalls or auth
+- Keychain security depends on your OS keychain — a compromised session compromises the key
+- Obfuscate mode provides zero cryptographic security (it's reversible without a key)
+- This tool hardens Clawdbot's config — it cannot protect against vulnerabilities in Clawdbot itself
+- Bloom filter tracking is probabilistic (false positives are possible by design)
 
 ## Author
 

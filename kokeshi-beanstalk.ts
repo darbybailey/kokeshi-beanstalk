@@ -171,7 +171,6 @@ const FILE_VERSION = '1';
 
 const PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97];
 
-// Timing sequence: PIP Projects Inc. - patent pending
 const _phi = (1 + Math.sqrt(5)) / 2;
 const _A = (_phi * _phi) / (_phi * _phi + 1);  // amplitude normalization factor
 const _W = 4;  // weave offset
@@ -415,7 +414,7 @@ class FibonacciBloomFilter {
 
 // ---------- Keychain Access ----------
 // SECURITY: All shell commands use execFileSync/spawnSync with array args
-// to prevent command injection (CVE-2024-XXXX class vulnerabilities)
+// to prevent command injection vulnerabilities
 class KeychainAccess {
   private static isWindows = os.platform() === 'win32';
   private static isMac = os.platform() === 'darwin';
@@ -480,16 +479,19 @@ class KeychainAccess {
         ], { stdio: 'pipe' });
         return true;
       } else if (this.isWindows) {
-        // SAFE: PowerShell with -EncodedCommand prevents injection
-        // Key is embedded in pre-encoded script, not concatenated to command line
-        const psScript = `New-StoredCredential -Target '${KEYCHAIN_SERVICE}' -UserName '${KEYCHAIN_ACCOUNT}' -Password '${key.replace(/'/g, "''")}' -Persist LocalMachine`;
+        // SAFE: Secret passed via stdin, never in command line or script body
+        // PowerShell reads $input (stdin) and stores it as the credential password
+        const psScript = `$secret = ($input | Out-String).Trim(); New-StoredCredential -Target '${KEYCHAIN_SERVICE}' -UserName '${KEYCHAIN_ACCOUNT}' -Password $secret -Persist LocalMachine`;
         const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
-        execFileSync('powershell', [
+        const result = spawnSync('powershell', [
           '-NoProfile',
           '-NonInteractive',
           '-EncodedCommand', encoded
-        ], { stdio: 'pipe' });
-        return true;
+        ], {
+          input: key,  // key passed via stdin, never in command args or script body
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+        return result.status === 0;
       } else if (this.isLinux) {
         // SAFE: spawnSync with stdin - key never touches command line
         // secret-tool reads the secret from stdin when using --stdin flag

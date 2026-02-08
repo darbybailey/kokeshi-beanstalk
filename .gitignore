@@ -3,4 +3,7 @@ node_modules
 dist
 *.log
 *.enc
+*.aes
+*.obf
 .env
+security-report.json
