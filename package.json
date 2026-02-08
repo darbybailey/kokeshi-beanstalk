@@ -4,7 +4,7 @@
   "description": "Runtime security guardian for Clawdbot - A Darby Tool from PIP Projects Inc.",
   "main": "kokeshi-beanstalk.ts",
   "bin": {
-    "kokeshi-beanstalk": "./kokeshi-beanstalk.ts"
+    "kokeshi-beanstalk": "kokeshi-beanstalk.ts"
   },
   "scripts": {
     "harden": "tsx kokeshi-beanstalk.ts harden",
@@ -23,9 +23,15 @@
   ],
   "author": "PIP Projects Inc. <darby@pipprojects.com>",
   "license": "MIT",
+  "files": [
+    "kokeshi-beanstalk.ts",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/darbybailey/kokeshi-beanstalk"
+    "url": "git+https://github.com/darbybailey/kokeshi-beanstalk.git"
   },
   "homepage": "https://github.com/darbybailey/kokeshi-beanstalk#readme",
   "engines": {
